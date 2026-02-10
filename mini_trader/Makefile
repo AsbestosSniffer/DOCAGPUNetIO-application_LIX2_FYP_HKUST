@@ -15,7 +15,7 @@ gpu: $(GPU_OUT)
 $(GPU_OUT): $(GPU_SRCS)
 	nvcc -O3 -std=c++17 -Iinclude $(GPU_SRCS) -o $(GPU_OUT)
 # UDP receiver (integrated with GPU pipeline - uses CUDA)
-RECEIVER_SRCS=src/udp_receiver.cpp
+RECEIVER_SRCS=src/udp_receiver.cu
 RECEIVER_OUT=udp_receiver
 
 receiver: $(RECEIVER_OUT)

@@ -3,6 +3,13 @@
 #include <string>
 #include <unordered_map>
 
+// CUDA qualifiers - only defined when compiling with nvcc
+#ifdef __CUDACC__
+  #define CUDA_CALLABLE __device__ __host__
+#else
+  #define CUDA_CALLABLE
+#endif
+
 // Binary event struct for all modules
 struct MarketEvent {
     uint64_t ts_ns;      // nanosecond timestamp
@@ -64,7 +71,7 @@ struct PerSymbolState {
     uint32_t total_trades;
 
     // Initialize state
-    __device__ __host__ void init() {
+    CUDA_CALLABLE void init() {
         candle_open = 0;
         candle_high = 0;
         candle_low = 1e9f;
@@ -79,7 +86,7 @@ struct PerSymbolState {
     }
 
     // Close current candle and move to history
-    __device__ __host__ void close_candle() {
+    CUDA_CALLABLE void close_candle() {
         if (candle_trade_count == 0) return;
 
         Candle c;
