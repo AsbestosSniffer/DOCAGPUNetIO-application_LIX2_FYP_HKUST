@@ -272,6 +272,7 @@ struct GPUPipeline {
                   << h_stats->total_signals << " signals ("
                   << h_stats->buy_count << "B/" << h_stats->sell_count << "S), "
                   << ms << "ms | PnL: $" << cumulative_pnl << " | Win Rate: " << get_win_rate() << "% | Drawdown: $" << get_max_drawdown() << "\n";
+        std::cout.flush();
     }
 
     void update_pnl_metrics() {
@@ -322,6 +323,7 @@ struct GPUPipeline {
         std::cout << "Total PnL: $" << cumulative_pnl << "\n";
         std::cout << "Win rate: " << get_win_rate() << "% (" << winning_trades << "/" << total_trades << ")\n";
         std::cout << "Max drawdown: $" << get_max_drawdown() << "\n";
+        std::cout.flush();
     }
 };
 
