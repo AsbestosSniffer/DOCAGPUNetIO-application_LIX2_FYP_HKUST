@@ -83,11 +83,19 @@ int main(int argc, char** argv) {
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(host.c_str());
 
+    // Cap events per UDP packet to stay under ~60KB limit
+    const size_t MAX_UDP_PAYLOAD = 60000;
+    int max_events_per_udp = (MAX_UDP_PAYLOAD - sizeof(PacketHeader)) / sizeof(MarketEvent);
+    int actual_events_per_packet = std::min(events_per_packet, max_events_per_udp);
+    if (actual_events_per_packet != events_per_packet) {
+        std::cout << "Note: reducing events_per_packet from " << events_per_packet << " to " << actual_events_per_packet << " to fit UDP limit\n";
+    }
+
     int sent = 0;
     int packet_seq = 0;
     auto start = std::chrono::steady_clock::now();
     while (sent < total_events) {
-        int n = std::min(events_per_packet, total_events - sent);
+        int n = std::min(actual_events_per_packet, total_events - sent);
         PacketHeader hdr;
         hdr.packet_seq = packet_seq++;
         hdr.event_count = n;
