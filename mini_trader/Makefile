@@ -53,4 +53,4 @@ $(OUT): $(SRCS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SRCS) -o $(OUT)
 
 clean:
-	rm -f $(OUT)
+	rm -f $(OUT) $(GPU_OUT) $(RECEIVER_OUT) $(REPLAYER_OUT) $(CONVERTER_OUT) $(LOGGER_OUT)
