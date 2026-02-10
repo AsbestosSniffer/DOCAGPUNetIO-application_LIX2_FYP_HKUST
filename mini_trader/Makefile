@@ -5,7 +5,7 @@ LOGGER_OUT=results_logger
 logger: $(LOGGER_OUT)
 
 $(LOGGER_OUT): $(LOGGER_SRCS)
-	g++ -O3 -std=c++17 $(LOGGER_SRCS) -o $(LOGGER_OUT)
+	g++ -O3 -std=c++17 -Iinclude $(LOGGER_SRCS) -o $(LOGGER_OUT)
 # GPU staging and pipeline
 GPU_SRCS=src/gpu_staging.cu
 GPU_OUT=gpu_staging
