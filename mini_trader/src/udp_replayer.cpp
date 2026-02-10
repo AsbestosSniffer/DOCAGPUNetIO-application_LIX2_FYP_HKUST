@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 #include "market_event.h"
 
 // Simple UDP replayer: reads .bin file or generates fake events, sends micro-batched UDP packets
