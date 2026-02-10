@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <algorithm>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -169,7 +170,14 @@ struct GPUPipeline {
     std::atomic<uint64_t> total_events_processed{0};
     std::atomic<uint64_t> total_batches{0};
 
-    GPUPipeline(const PipelineConfig& cfg) : config(cfg) {
+    // Live PnL tracking
+    std::vector<std::vector<Order>> order_queue;  // Per-symbol open buy orders
+    float cumulative_pnl{0};
+    float peak_pnl{0};
+    int total_trades{0};
+    int winning_trades{0};
+
+    GPUPipeline(const PipelineConfig& cfg) : config(cfg), order_queue(cfg.n_symbols) {
         cudaHostAlloc(&h_events, cfg.max_events_per_batch * sizeof(MarketEvent),
                       cudaHostAllocDefault);
         cudaHostAlloc(&h_states, cfg.n_symbols * sizeof(PerSymbolState),
@@ -246,6 +254,8 @@ struct GPUPipeline {
 
         cudaMemcpyAsync(h_stats, d_stats, sizeof(OrderStats),
                        cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(h_orders, d_orders, config.n_symbols * 2 * sizeof(Order),
+                       cudaMemcpyDeviceToHost, stream);
 
         cudaStreamSynchronize(stream);
 
@@ -255,10 +265,49 @@ struct GPUPipeline {
         total_events_processed += n_events;
         total_batches++;
 
+        // Process orders for PnL calculation
+        update_pnl_metrics();
+
         std::cout << "[GPU] Batch " << total_batches << ": " << n_events << " events, "
                   << h_stats->total_signals << " signals ("
                   << h_stats->buy_count << "B/" << h_stats->sell_count << "S), "
-                  << ms << "ms\n";
+                  << ms << "ms | PnL: $" << cumulative_pnl << " | Win Rate: " << get_win_rate() << "% | Drawdown: $" << get_max_drawdown() << "\n";
+    }
+
+    void update_pnl_metrics() {
+        // Process orders from h_orders
+        for (int i = 0; i < h_stats->total_signals; ++i) {
+            const Order& o = h_orders[i];
+
+            if (o.side == 0) {  // BUY
+                order_queue[o.symbol_id].push_back(o);
+            } else {  // SELL
+                if (!order_queue[o.symbol_id].empty()) {
+                    Order buy = order_queue[o.symbol_id].front();
+                    order_queue[o.symbol_id].erase(order_queue[o.symbol_id].begin());
+
+                    // Calculate PnL for this closed trade
+                    float pnl = (o.price - buy.price) * buy.qty;
+                    cumulative_pnl += pnl;
+                    total_trades++;
+
+                    if (pnl > 0) {
+                        winning_trades++;
+                    }
+
+                    peak_pnl = std::max(peak_pnl, cumulative_pnl);
+                }
+            }
+        }
+    }
+
+    float get_win_rate() const {
+        if (total_trades == 0) return 0.0f;
+        return 100.0f * winning_trades / total_trades;
+    }
+
+    float get_max_drawdown() const {
+        return std::max(0.0f, peak_pnl - cumulative_pnl);
     }
 
     void print_stats() {
@@ -268,6 +317,11 @@ struct GPUPipeline {
         if (total_batches > 0) {
             std::cout << "Avg batch size: " << (total_events_processed / total_batches) << "\n";
         }
+        std::cout << "\n=== Trade Performance ===\n";
+        std::cout << "Total trades closed: " << total_trades << "\n";
+        std::cout << "Total PnL: $" << cumulative_pnl << "\n";
+        std::cout << "Win rate: " << get_win_rate() << "% (" << winning_trades << "/" << total_trades << ")\n";
+        std::cout << "Max drawdown: $" << get_max_drawdown() << "\n";
     }
 };
 

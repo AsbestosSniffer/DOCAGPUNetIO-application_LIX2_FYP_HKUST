@@ -4,11 +4,14 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <queue>
+#include <algorithm>
 #include "market_event.h"
 
 /**
  * Simple results logger for trading pipeline output
  * Reads order statistics and writes detailed logs
+ * Calculates PnL, Win Rate, and Max Drawdown
  */
 
 struct OrderResult {
@@ -27,6 +30,14 @@ struct BatchStats {
     uint32_t sell_count;
     float total_qty;
     double kernel_time_ms;
+};
+
+struct TradeResult {
+    float entry_price;
+    float exit_price;
+    float qty;
+    float pnl;
+    bool is_winning;
 };
 
 void log_orders_csv(const std::vector<OrderResult>& orders, const std::string& out_csv) {
@@ -58,7 +69,62 @@ void log_batch_stats_csv(const std::vector<BatchStats>& stats, const std::string
     std::cout << "Batch stats written to " << out_csv << " (" << stats.size() << " batches)\n";
 }
 
-void print_summary(const std::vector<BatchStats>& stats) {
+struct PnLMetrics {
+    float total_pnl;
+    float max_drawdown;
+    int total_trades;
+    int winning_trades;
+    float win_rate;
+};
+
+PnLMetrics calculate_pnl_metrics(const std::vector<OrderResult>& orders) {
+    PnLMetrics metrics = {0, 0, 0, 0, 0};
+
+    // Use a queue of open BUY positions per symbol
+    std::vector<std::queue<OrderResult>> open_buys(10);  // 10 symbols
+    std::vector<TradeResult> closed_trades;
+    float cumulative_pnl = 0;
+    float peak_pnl = 0;
+
+    for (const auto& order : orders) {
+        if (order.side == 0) {  // BUY
+            open_buys[order.symbol_id].push(order);
+        } else {  // SELL
+            if (!open_buys[order.symbol_id].empty()) {
+                auto buy = open_buys[order.symbol_id].front();
+                open_buys[order.symbol_id].pop();
+
+                // Calculate PnL for this closed trade
+                float pnl = (order.price - buy.price) * buy.qty;
+                bool is_winning = pnl > 0;
+
+                TradeResult trade = {buy.price, order.price, buy.qty, pnl, is_winning};
+                closed_trades.push_back(trade);
+
+                cumulative_pnl += pnl;
+                peak_pnl = std::max(peak_pnl, cumulative_pnl);
+                metrics.total_pnl = cumulative_pnl;
+
+                // Track drawdown
+                float drawdown = peak_pnl - cumulative_pnl;
+                metrics.max_drawdown = std::max(metrics.max_drawdown, drawdown);
+            }
+        }
+    }
+
+    // Calculate win rate
+    metrics.total_trades = closed_trades.size();
+    if (metrics.total_trades > 0) {
+        for (const auto& trade : closed_trades) {
+            if (trade.is_winning) metrics.winning_trades++;
+        }
+        metrics.win_rate = 100.0f * metrics.winning_trades / metrics.total_trades;
+    }
+
+    return metrics;
+}
+
+void print_summary(const std::vector<BatchStats>& stats, const PnLMetrics& pnl) {
     if (stats.empty()) return;
 
     uint64_t total_events = 0;
@@ -93,6 +159,14 @@ void print_summary(const std::vector<BatchStats>& stats) {
         std::cout << "Avg kernel time per batch: " << std::fixed << std::setprecision(3)
                   << avg_time << " ms\n";
     }
+
+    // Trading Performance
+    std::cout << "\n=== Trade Performance ===\n";
+    std::cout << "Total trades closed: " << pnl.total_trades << "\n";
+    std::cout << "Total PnL: $" << std::fixed << std::setprecision(2) << pnl.total_pnl << "\n";
+    std::cout << "Win rate: " << std::fixed << std::setprecision(1) << pnl.win_rate << "% ("
+              << pnl.winning_trades << "/" << pnl.total_trades << ")\n";
+    std::cout << "Max drawdown: $" << std::fixed << std::setprecision(2) << pnl.max_drawdown << "\n";
 }
 
 int main(int argc, char** argv) {
@@ -105,12 +179,21 @@ int main(int argc, char** argv) {
         example_stats.push_back({2, 1000, 7, 4, 3, 0.07f, 11.8});
         example_stats.push_back({3, 1000, 6, 3, 3, 0.06f, 12.1});
 
-        print_summary(example_stats);
-
         std::vector<OrderResult> example_orders;
-        example_orders.push_back({0, 0, 30000.0f, 0.01f, 1640995200000000000ULL});
-        example_orders.push_back({1, 1, 2000.0f, 0.1f, 1640995260000000000ULL});
-        example_orders.push_back({2, 0, 500.0f, 0.5f, 1640995320000000000ULL});
+        // Create a realistic trading sequence: BUY at 30000, SELL at 30200 (+$2 profit)
+        example_orders.push_back({0, 0, 30000.0f, 0.01f, 1640995200000000000ULL});  // BUY BTC
+        example_orders.push_back({0, 1, 30200.0f, 0.01f, 1640995260000000000ULL});   // SELL BTC (+$2)
+        // BUY at 2000, SELL at 1950 (-$5 loss)
+        example_orders.push_back({1, 0, 2000.0f, 0.1f, 1640995320000000000ULL});     // BUY ETH
+        example_orders.push_back({1, 1, 1950.0f, 0.1f, 1640995380000000000ULL});     // SELL ETH (-$5)
+        // BUY at 500, SELL at 520 (+$10 profit)
+        example_orders.push_back({2, 0, 500.0f, 0.5f, 1640995440000000000ULL});      // BUY BNB
+        example_orders.push_back({2, 1, 520.0f, 0.5f, 1640995500000000000ULL});      // SELL BNB (+$10)
+
+        // Calculate trading metrics
+        PnLMetrics pnl = calculate_pnl_metrics(example_orders);
+
+        print_summary(example_stats, pnl);
 
         log_orders_csv(example_orders, "orders_example.csv");
         log_batch_stats_csv(example_stats, "batch_stats_example.csv");

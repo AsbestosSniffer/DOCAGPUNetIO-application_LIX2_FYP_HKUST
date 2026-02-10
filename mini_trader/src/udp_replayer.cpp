@@ -27,7 +27,10 @@ struct PacketHeader {
 
 int main(int argc, char** argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <host> <port> <bin_file|FAKE> <events_per_packet> <total_events> [pacing_mode]\n";
+        std::cerr << "Usage: " << argv[0] << " <host> <port> <bin_file|FAKE> <events_per_packet> <total_events> <pacing_mode> [delay_ms_per_packet]\n";
+        std::cerr << "  pacing_mode: 0=blast(instant), 1=realtime(1us/event), 2=hybrid(burst+sleep), 3=timed(delay per packet)\n";
+        std::cerr << "  Example for 30-second simulation with 50K events:\n";
+        std::cerr << "    " << argv[0] << " 127.0.0.1 9999 FAKE 1874 50000 3 1100\n";
         return 1;
     }
     std::string host = argv[1];
@@ -36,6 +39,7 @@ int main(int argc, char** argv) {
     int events_per_packet = std::stoi(argv[4]);
     int total_events = std::stoi(argv[5]);
     int pacing_mode = (argc > 6) ? std::stoi(argv[6]) : 0;
+    int delay_ms_per_packet = (argc > 7) ? std::stoi(argv[7]) : 0;
 
     std::vector<MarketEvent> events;
     if (bin_file == "FAKE") {
@@ -112,6 +116,7 @@ int main(int argc, char** argv) {
         // pacing
         if (pacing_mode == 1) std::this_thread::sleep_for(std::chrono::microseconds(n)); // 1us/event
         else if (pacing_mode == 2 && (packet_seq % 10) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else if (pacing_mode == 3 && delay_ms_per_packet > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_per_packet));
     }
     auto end = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(end - start).count();
