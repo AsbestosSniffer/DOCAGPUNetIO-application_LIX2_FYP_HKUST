@@ -64,7 +64,7 @@ struct PerSymbolState {
     uint32_t total_trades;
 
     // Initialize state
-    void init() {
+    __device__ __host__ void init() {
         candle_open = 0;
         candle_high = 0;
         candle_low = 1e9f;
@@ -79,7 +79,7 @@ struct PerSymbolState {
     }
 
     // Close current candle and move to history
-    void close_candle() {
+    __device__ __host__ void close_candle() {
         if (candle_trade_count == 0) return;
 
         Candle c;
