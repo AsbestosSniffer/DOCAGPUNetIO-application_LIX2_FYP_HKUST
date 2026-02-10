@@ -2,20 +2,126 @@
 #include <fstream>
 #include <vector>
 #include <string>
+#include <chrono>
+#include <iomanip>
+#include "market_event.h"
 
-void log_results(const std::vector<int>& orders, const std::string& out_csv) {
+/**
+ * Simple results logger for trading pipeline output
+ * Reads order statistics and writes detailed logs
+ */
+
+struct OrderResult {
+    uint32_t symbol_id;
+    uint8_t side;        // 0=buy, 1=sell
+    float price;
+    float qty;
+    uint64_t ts_ns;
+};
+
+struct BatchStats {
+    uint64_t batch_num;
+    uint32_t event_count;
+    uint32_t signal_count;
+    uint32_t buy_count;
+    uint32_t sell_count;
+    float total_qty;
+    double kernel_time_ms;
+};
+
+void log_orders_csv(const std::vector<OrderResult>& orders, const std::string& out_csv) {
     std::ofstream fout(out_csv);
-    fout << "symbol_id,order\n";
-    for (size_t i = 0; i < orders.size(); ++i) {
-        fout << i << "," << orders[i] << "\n";
+    fout << "symbol,side,price,qty,timestamp_ns\n";
+    for (const auto& o : orders) {
+        std::string symbol = id_to_symbol(o.symbol_id);
+        std::string side_str = (o.side == 0) ? "BUY" : "SELL";
+        fout << symbol << "," << side_str << "," << o.price << "," << o.qty << "," << o.ts_ns << "\n";
     }
     fout.close();
-    std::cout << "Results written to " << out_csv << "\n";
+    std::cout << "Orders written to " << out_csv << " (" << orders.size() << " orders)\n";
+}
+
+void log_batch_stats_csv(const std::vector<BatchStats>& stats, const std::string& out_csv) {
+    std::ofstream fout(out_csv);
+    fout << "batch_num,event_count,signal_count,buy_count,sell_count,total_qty,kernel_time_ms\n";
+
+    for (const auto& s : stats) {
+        fout << s.batch_num << ","
+             << s.event_count << ","
+             << s.signal_count << ","
+             << s.buy_count << ","
+             << s.sell_count << ","
+             << s.total_qty << ","
+             << std::fixed << std::setprecision(3) << s.kernel_time_ms << "\n";
+    }
+    fout.close();
+    std::cout << "Batch stats written to " << out_csv << " (" << stats.size() << " batches)\n";
+}
+
+void print_summary(const std::vector<BatchStats>& stats) {
+    if (stats.empty()) return;
+
+    uint64_t total_events = 0;
+    uint32_t total_signals = 0;
+    uint32_t total_buy = 0;
+    uint32_t total_sell = 0;
+    double total_time = 0;
+
+    for (const auto& s : stats) {
+        total_events += s.event_count;
+        total_signals += s.signal_count;
+        total_buy += s.buy_count;
+        total_sell += s.sell_count;
+        total_time += s.kernel_time_ms;
+    }
+
+    double signal_rate = (total_signals > 0) ? (100.0 * total_signals / total_events) : 0;
+    double throughput = (total_time > 0) ? (1000.0 * total_events / total_time) : 0;
+
+    std::cout << "\n=== Trading Pipeline Summary ===\n";
+    std::cout << "Total batches: " << stats.size() << "\n";
+    std::cout << "Total events: " << total_events << "\n";
+    std::cout << "Total signals: " << total_signals << " (" << std::fixed << std::setprecision(2)
+              << signal_rate << "%)\n";
+    std::cout << "  BUY signals: " << total_buy << "\n";
+    std::cout << "  SELL signals: " << total_sell << "\n";
+    std::cout << "Total kernel time: " << std::fixed << std::setprecision(2) << total_time << " ms\n";
+    std::cout << "Throughput: " << std::fixed << std::setprecision(0) << throughput << " events/sec\n";
+
+    if (stats.size() > 1) {
+        double avg_time = total_time / stats.size();
+        std::cout << "Avg kernel time per batch: " << std::fixed << std::setprecision(3)
+                  << avg_time << " ms\n";
+    }
 }
 
 int main(int argc, char** argv) {
-    std::vector<int> orders = {1,0,1,0,0,1,1,0,0,1};
-    std::string out_csv = (argc > 1) ? argv[1] : "orders.csv";
-    log_results(orders, out_csv);
+    std::string mode = (argc > 1) ? argv[1] : "print";
+
+    if (mode == "print") {
+        // Standalone mode: print hardcoded example
+        std::vector<BatchStats> example_stats;
+        example_stats.push_back({1, 1000, 5, 3, 2, 0.05f, 12.5});
+        example_stats.push_back({2, 1000, 7, 4, 3, 0.07f, 11.8});
+        example_stats.push_back({3, 1000, 6, 3, 3, 0.06f, 12.1});
+
+        print_summary(example_stats);
+
+        std::vector<OrderResult> example_orders;
+        example_orders.push_back({0, 0, 30000.0f, 0.01f, 1640995200000000000ULL});
+        example_orders.push_back({1, 1, 2000.0f, 0.1f, 1640995260000000000ULL});
+        example_orders.push_back({2, 0, 500.0f, 0.5f, 1640995320000000000ULL});
+
+        log_orders_csv(example_orders, "orders_example.csv");
+        log_batch_stats_csv(example_stats, "batch_stats_example.csv");
+
+        std::cout << "(This is example output. Run with real pipeline data.)\n";
+    }
+    else {
+        std::cerr << "Usage: " << argv[0] << " [mode]\n";
+        std::cerr << "  mode: print (default, shows example output)\n";
+        return 1;
+    }
+
     return 0;
 }

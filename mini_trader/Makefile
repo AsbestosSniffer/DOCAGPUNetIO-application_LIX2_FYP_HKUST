@@ -14,14 +14,14 @@ gpu: $(GPU_OUT)
 
 $(GPU_OUT): $(GPU_SRCS)
 	nvcc -O3 -std=c++17 -Iinclude $(GPU_SRCS) -o $(GPU_OUT)
-# UDP receiver
+# UDP receiver (integrated with GPU pipeline - uses CUDA)
 RECEIVER_SRCS=src/udp_receiver.cpp
 RECEIVER_OUT=udp_receiver
 
 receiver: $(RECEIVER_OUT)
 
 $(RECEIVER_OUT): $(RECEIVER_SRCS)
-	g++ -O3 -std=c++17 -Iinclude $(RECEIVER_SRCS) -o $(RECEIVER_OUT)
+	$(NVCC) -O3 -std=c++17 -Iinclude $(RECEIVER_SRCS) -o $(RECEIVER_OUT)
 # UDP replayer
 REPLAYER_SRCS=src/udp_replayer.cpp
 REPLAYER_OUT=udp_replayer

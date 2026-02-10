@@ -1,6 +1,4 @@
-# WARNING: This will overwrite your local development branch with the remote version!
-git fetch origin
-git reset --hard origin/development#include <iostream>
+#include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
