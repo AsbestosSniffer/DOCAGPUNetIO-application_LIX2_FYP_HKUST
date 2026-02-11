@@ -15,7 +15,7 @@ gpu: $(GPU_OUT)
 $(GPU_OUT): $(GPU_SRCS)
 	nvcc -O3 -std=c++17 -Iinclude $(GPU_SRCS) -o $(GPU_OUT)
 # UDP receiver (integrated with GPU pipeline - uses CUDA)
-RECEIVER_SRCS=src/udp_receiver.cu
+RECEIVER_SRCS=src/udp_receiver.cpp
 RECEIVER_OUT=udp_receiver
 
 receiver: $(RECEIVER_OUT)
@@ -47,10 +47,7 @@ INCLUDES=-Iinclude
 SRCS=src/main.cu src/kernels.cu src/market_sim.cpp
 OUT=mini_trader_stream
 
-all: $(OUT)
-
-$(OUT): $(SRCS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(SRCS) -o $(OUT)
+all: converter replayer receiver gpu logger
 
 clean:
 	rm -f $(OUT) $(GPU_OUT) $(RECEIVER_OUT) $(REPLAYER_OUT) $(CONVERTER_OUT) $(LOGGER_OUT)
