@@ -1,4 +1,11 @@
 # Results logger
+NVCC=nvcc
+CXXFLAGS=-O3 -std=c++17
+NVCCFLAGS=-O3 -std=c++17
+INCLUDES=-Iinclude
+SRCS=src/main.cu src/kernels.cu src/market_sim.cpp
+OUT=mini_trader_stream
+
 LOGGER_SRCS=src/results_logger.cpp
 LOGGER_OUT=results_logger
 
@@ -38,14 +45,6 @@ converter: $(CONVERTER_OUT)
 
 $(CONVERTER_OUT): $(CONVERTER_SRCS)
 	g++ -O3 -std=c++17 -Iinclude $(CONVERTER_SRCS) -o $(CONVERTER_OUT)
-NVCC=nvcc
-CXXFLAGS=-O3 -std=c++17
-NVCCFLAGS=-O3 -std=c++17
-
-INCLUDES=-Iinclude
-
-SRCS=src/main.cu src/kernels.cu src/market_sim.cpp
-OUT=mini_trader_stream
 
 all: $(OUT)
 
