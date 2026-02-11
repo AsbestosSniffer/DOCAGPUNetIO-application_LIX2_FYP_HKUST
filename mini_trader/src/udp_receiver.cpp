@@ -157,6 +157,7 @@ struct GPUPipeline {
     PerSymbolState* h_states;
     Order* h_orders;
     OrderStats* h_stats;
+    int* h_order_count;
 
     MarketEvent* d_events;
     MarketEvent* d_parsed;
@@ -185,6 +186,7 @@ struct GPUPipeline {
         cudaHostAlloc(&h_orders, cfg.n_symbols * 2 * sizeof(Order),
                       cudaHostAllocDefault);
         cudaHostAlloc(&h_stats, sizeof(OrderStats), cudaHostAllocDefault);
+        cudaHostAlloc(&h_order_count, sizeof(int), cudaHostAllocDefault);
 
         cudaMalloc(&d_events, cfg.max_events_per_batch * sizeof(MarketEvent));
         cudaMalloc(&d_parsed, cfg.max_events_per_batch * sizeof(MarketEvent));
@@ -206,6 +208,7 @@ struct GPUPipeline {
         cudaFreeHost(h_states);
         cudaFreeHost(h_orders);
         cudaFreeHost(h_stats);
+        cudaFreeHost(h_order_count);
 
         cudaFree(d_events);
         cudaFree(d_parsed);
@@ -245,11 +248,17 @@ struct GPUPipeline {
             d_states, config.n_symbols, d_orders, d_order_count
         );
 
+        // Copy order count back from device BEFORE using it
+        cudaMemcpyAsync(h_order_count, d_order_count, sizeof(int),
+                       cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        int actual_orders = *h_order_count;
+
         OrderStats zeros = {0, 0, 0, 0.0f};
         cudaMemcpyAsync(d_stats, &zeros, sizeof(OrderStats),
                        cudaMemcpyHostToDevice, stream);
         pack_orders_kernel<<<strategy_grid, block_size, 0, stream>>>(
-            d_orders, config.n_symbols, d_orders, d_stats
+            d_orders, actual_orders, d_orders, d_stats
         );
 
         cudaMemcpyAsync(h_stats, d_stats, sizeof(OrderStats),
