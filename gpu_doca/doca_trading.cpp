@@ -17,17 +17,15 @@
  * the server with DOCA installed at /opt/mellanox/doca/.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <csignal>
 #include <unistd.h>
-#include <stdbool.h>
 
 /* DOCA headers — only available on server with SDK installed */
 #ifdef HAVE_DOCA
 #include <doca_gpunetio.h>
-#include <doca_gpunetio_dev.h>
 #include <doca_eth_rxq.h>
 #include <doca_flow.h>
 #include <doca_pe.h>

@@ -1,6 +1,7 @@
 #pragma once
 #include "market_event.h"
 #include <vector>
+#include <deque>
 #include <cstdio>
 #include <algorithm>
 #include <cmath>
@@ -10,17 +11,17 @@
 
 struct PnLTracker {
     // Per-symbol open buy orders (FIFO queue for matching)
-    std::vector<Order> open_buys[N_SYMBOLS];
+    std::deque<Order> open_buys[N_SYMBOLS];
 
-    float cumulative_pnl  = 0;
-    float peak_pnl        = 0;
-    int   total_trades    = 0;
-    int   winning_trades  = 0;
+    double cumulative_pnl  = 0;
+    double peak_pnl        = 0;
+    int    total_trades    = 0;
+    int    winning_trades  = 0;
 
     void process_orders(const Order* orders, int n_orders) {
         for (int i = 0; i < n_orders; ++i) {
             const Order& o = orders[i];
-            if (o.symbol_id >= N_SYMBOLS) continue;
+            if (o.symbol_id >= (uint32_t)N_SYMBOLS) continue;
 
             if (o.side == 0) { // BUY
                 open_buys[o.symbol_id].push_back(o);
@@ -28,8 +29,8 @@ struct PnLTracker {
                 auto& q = open_buys[o.symbol_id];
                 if (!q.empty()) {
                     Order buy = q.front();
-                    q.erase(q.begin());
-                    float pnl = (o.price - buy.price) * buy.qty;
+                    q.pop_front();
+                    double pnl = (double)(o.price - buy.price) * (double)std::min(o.qty, buy.qty);
                     cumulative_pnl += pnl;
                     total_trades++;
                     if (pnl > 0) winning_trades++;
@@ -39,12 +40,12 @@ struct PnLTracker {
         }
     }
 
-    float win_rate() const {
-        return total_trades > 0 ? 100.0f * winning_trades / total_trades : 0;
+    double win_rate() const {
+        return total_trades > 0 ? 100.0 * winning_trades / total_trades : 0;
     }
 
-    float max_drawdown() const {
-        return std::max(0.0f, peak_pnl - cumulative_pnl);
+    double max_drawdown() const {
+        return std::max(0.0, peak_pnl - cumulative_pnl);
     }
 
     void print_summary() const {

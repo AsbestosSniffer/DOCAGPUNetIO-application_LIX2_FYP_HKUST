@@ -2,13 +2,13 @@
  * GPU-side DOCA GPUNetIO Packet Receiver + Trading Pipeline
  * ───────────────────────────────────────────────────────────
  * This persistent CUDA kernel runs on the GPU and:
- *   1. Receives packets directly from NIC via doca_gpu_dev_eth_rxq_recv()
+ *   1. Receives packets directly from NIC via doca_gpu_dev_eth_rxq
  *   2. Parses Ethernet/IP/TCP headers on GPU
  *   3. Extracts MarketEvent from packet payload
- *   4. Runs the trading pipeline (candle agg + strategy)
+ *   4. Runs the trading pipeline (candle agg + features + strategy)
  *   5. Signals CPU via GPU semaphore when batch is ready
  *
- * NOTE: Requires DOCA GPUNetIO device headers. Only compiles on server.
+ * NOTE: Requires DOCA GPUNetIO device headers (.cuh). Only compiles on server.
  */
 
 #include "../../common/market_event.h"
@@ -16,9 +16,11 @@
 #include <cstdint>
 
 #ifdef HAVE_DOCA
-#include <doca_gpunetio_dev.h>
-#include <doca_gpunetio_dev_eth_rxq.h>
-#include <doca_gpunetio_dev_sem.h>
+/* DOCA 3.x GPU device headers use .cuh extension */
+#include <doca_gpunetio.h>
+#include <doca_gpunetio_dev_eth_rxq.cuh>
+#include <doca_gpunetio_dev_sem.cuh>
+#include <doca_gpunetio_dev_buf.cuh>
 #endif
 
 /* ─── Network Header Structures (parsed on GPU) ─────────────────────── */
@@ -115,6 +117,13 @@ __device__ bool parse_packet_to_event(
 
 #ifdef HAVE_DOCA
 
+#ifndef MAX_RX_BURST
+#define MAX_RX_BURST 64
+#endif
+#ifndef NUM_SEMAPHORES
+#define NUM_SEMAPHORES 16
+#endif
+
 __global__ void gpu_receive_and_process(
     struct doca_gpu_eth_rxq* rxq,
     struct doca_gpu_semaphore_gpu* sem,
@@ -159,36 +168,38 @@ __global__ void gpu_receive_and_process(
 
         if (event_count == 0) continue;
 
-        /* ── Step 3: Apply events (candle aggregation) ── */
-        for (int i = tid; i < event_count; i += blockDim.x) {
-            const MarketEvent& ev = events[i];
-            if (ev.symbol_id >= N_SYMBOLS) continue;
+        /* ── Step 3: Apply events — thread 0 per symbol for correctness ── */
+        if (tid < N_SYMBOLS) {
+            PerSymbolState& s = states[tid];
+            for (int i = 0; i < event_count; i++) {
+                const MarketEvent& ev = events[i];
+                if (ev.symbol_id != (uint32_t)tid) continue;
 
-            PerSymbolState& s = states[ev.symbol_id];
-            uint64_t candle_ts = (ev.ts_ns / CANDLE_INTERVAL_NS) * CANDLE_INTERVAL_NS;
+                uint64_t candle_ts = (ev.ts_ns / CANDLE_INTERVAL_NS) * CANDLE_INTERVAL_NS;
 
-            if (s.candle_trade_count == 0) {
-                s.candle_start_ts = candle_ts;
-                s.candle_open = ev.price;
-                s.candle_high = ev.price;
-                s.candle_low  = ev.price;
-            } else if (candle_ts != s.candle_start_ts) {
-                s.close_candle();
-                s.candle_start_ts = candle_ts;
-                s.candle_open = ev.price;
-                s.candle_high = ev.price;
-                s.candle_low  = ev.price;
+                if (s.candle_trade_count == 0) {
+                    s.candle_start_ts = candle_ts;
+                    s.candle_open = ev.price;
+                    s.candle_high = ev.price;
+                    s.candle_low  = ev.price;
+                } else if (candle_ts != s.candle_start_ts) {
+                    s.close_candle();
+                    s.candle_start_ts = candle_ts;
+                    s.candle_open = ev.price;
+                    s.candle_high = ev.price;
+                    s.candle_low  = ev.price;
+                }
+
+                s.candle_high = fmaxf(s.candle_high, ev.price);
+                s.candle_low  = fminf(s.candle_low,  ev.price);
+                s.candle_close = ev.price;
+                s.candle_volume += ev.qty;
+                s.candle_trade_count++;
+                s.last_price = ev.price;
+                s.total_trades++;
+                s.vwap_sum_pq += (double)ev.price * (double)ev.qty;
+                s.vwap_sum_q  += (double)ev.qty;
             }
-
-            s.candle_high = fmaxf(s.candle_high, ev.price);
-            s.candle_low  = fminf(s.candle_low,  ev.price);
-            s.candle_close = ev.price;
-            s.candle_volume += ev.qty;
-            s.candle_trade_count++;
-
-            s.last_price = ev.price;
-            s.total_trades++;
-            s.vwap = (s.vwap * (s.total_trades - 1) + ev.price) / s.total_trades;
         }
         __syncthreads();
 
@@ -210,9 +221,10 @@ __global__ void gpu_receive_and_process(
                 o.order_type = 0;
 
                 bool emit = false;
-                if (pc > 0.001f && s.last_price > s.vwap) {
+                float v = s.vwap();
+                if (pc > 0.001f && s.last_price > v) {
                     o.side = 0; emit = true;
-                } else if (pc < -0.001f && s.last_price < s.vwap) {
+                } else if (pc < -0.001f && s.last_price < v) {
                     o.side = 1; emit = true;
                 }
 
@@ -248,14 +260,16 @@ __global__ void gpu_receive_stub(
     PerSymbolState* states, Order* orders, int* order_count,
     int batch_size)
 {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    // Each block handles one symbol — no race conditions
+    int sid = blockIdx.x;
+    if (sid >= N_SYMBOLS || threadIdx.x != 0) return;
 
-    // Process events
-    for (int i = tid; i < n_events; i += blockDim.x * gridDim.x) {
+    PerSymbolState& s = states[sid];
+
+    for (int i = 0; i < n_events; i++) {
         const MarketEvent& ev = input_events[i];
-        if (ev.symbol_id >= N_SYMBOLS) continue;
+        if (ev.symbol_id != (uint32_t)sid) continue;
 
-        PerSymbolState& s = states[ev.symbol_id];
         uint64_t candle_ts = (ev.ts_ns / CANDLE_INTERVAL_NS) * CANDLE_INTERVAL_NS;
 
         if (s.candle_trade_count == 0) {
@@ -278,7 +292,8 @@ __global__ void gpu_receive_stub(
         s.candle_trade_count++;
         s.last_price = ev.price;
         s.total_trades++;
-        s.vwap = (s.vwap * (s.total_trades - 1) + ev.price) / s.total_trades;
+        s.vwap_sum_pq += (double)ev.price * (double)ev.qty;
+        s.vwap_sum_q  += (double)ev.qty;
     }
 }
 

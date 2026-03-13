@@ -1,6 +1,6 @@
 #pragma once
-#include <cstdint>
-#include <cstring>
+#include <stdint.h>
+#include <string.h>
 
 #ifdef __CUDACC__
   #define CUDA_CALLABLE __device__ __host__
@@ -8,17 +8,23 @@
   #define CUDA_CALLABLE
 #endif
 
-/* ─── Core Data Structures ─────────────────────────────────────────────── */
+/* ─── Constants ────────────────────────────────────────────────────────── */
 
 static const int N_SYMBOLS = 10;
-static const int MAX_CANDLE_HISTORY = 10;
+static const int MAX_CANDLE_HISTORY = 64;
 static const uint64_t CANDLE_INTERVAL_NS = 60000000000ULL; // 60 seconds
+
+// Monte Carlo simulation parameters
+static const int MC_PATHS = 256;    // simulation paths per symbol
+static const int MC_STEPS = 100;    // steps per path
 
 // Symbol mapping for 10 Binance tickers
 static const char* SYMBOL_NAMES[N_SYMBOLS] = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT"
 };
+
+/* ─── Core Data Structures ─────────────────────────────────────────────── */
 
 // Binary event struct — shared by all three systems
 struct __attribute__((packed)) MarketEvent {
@@ -40,7 +46,7 @@ struct Candle {
 
 // Per-symbol state for candle aggregation and features
 struct PerSymbolState {
-    // Current candle
+    // Current candle being built
     float candle_open, candle_high, candle_low, candle_close;
     float candle_volume;
     uint32_t candle_trade_count;
@@ -50,15 +56,23 @@ struct PerSymbolState {
     Candle closed_candles[MAX_CANDLE_HISTORY];
     int closed_count;
 
-    // Features
-    float vwap;
+    // VWAP (volume-weighted average price)
+    double vwap_sum_pq;  // sum(price * qty)
+    double vwap_sum_q;   // sum(qty)
+
     float last_price;
     uint32_t total_trades;
 
     CUDA_CALLABLE void init() {
         candle_open = 0; candle_high = 0; candle_low = 1e9f; candle_close = 0;
         candle_volume = 0; candle_trade_count = 0; candle_start_ts = 0;
-        closed_count = 0; vwap = 0; last_price = 0; total_trades = 0;
+        closed_count = 0;
+        vwap_sum_pq = 0; vwap_sum_q = 0;
+        last_price = 0; total_trades = 0;
+    }
+
+    CUDA_CALLABLE float vwap() const {
+        return vwap_sum_q > 0 ? (float)(vwap_sum_pq / vwap_sum_q) : 0.0f;
     }
 
     CUDA_CALLABLE void close_candle() {
@@ -79,6 +93,42 @@ struct PerSymbolState {
         candle_open = 0; candle_high = 0; candle_low = 1e9f;
         candle_close = 0; candle_volume = 0; candle_trade_count = 0;
     }
+};
+
+// Feature vector — computed per symbol by GPU/CPU feature engineering
+struct FeatureVector {
+    // Exponential Moving Averages
+    float ema_5, ema_10, ema_20, ema_50;
+
+    // RSI (Relative Strength Index, 14-period)
+    float rsi;
+
+    // Bollinger Bands (20-period, 2 std dev)
+    float bb_upper, bb_middle, bb_lower;
+
+    // MACD (12, 26, signal 9)
+    float macd_line, macd_signal, macd_hist;
+
+    // ATR (Average True Range, 14-period)
+    float atr;
+
+    // Volatility (annualized realized vol from log returns)
+    float volatility;
+
+    // Volume analysis
+    float volume_ratio;   // current volume vs moving average
+
+    // Price features
+    float momentum;       // rate of change
+    float vwap_deviation; // price vs VWAP
+
+    // Monte Carlo risk metrics
+    float var_95;              // 95% Value at Risk
+    float expected_shortfall;  // Conditional VaR (CVaR)
+
+    // Combined signal
+    float signal_strength;
+    int   signal_side;    // -1=no signal, 0=buy, 1=sell
 };
 
 // Order output
