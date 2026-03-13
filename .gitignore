@@ -1,0 +1,35 @@
+# Binaries
+cpu_baseline/cpu_baseline
+gpu_rdma/gpu_rdma_pipeline
+mini_trader/mini_trader_stream
+mini_trader/gpu_staging
+mini_trader/udp_receiver
+mini_trader/udp_replayer
+mini_trader/csv_to_bin_converter
+mini_trader/results_logger
+
+# Data files (too large for git)
+*.bin
+*.csv
+!requirements.txt
+
+# Build artifacts
+gpu_doca/build/
+*.o
+*.d
+
+# Benchmark results (generated)
+benchmark/results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
