@@ -7,8 +7,8 @@ This document covers everything needed to build and run the project on the HKUST
 ## 1. Server Access
 
 ```bash
-ssh lix2@lxcpu1.cse.ust.hk
-# Password authentication (ED25519 key fingerprint: SHA256:hTyj6Fm52MkBSCjLVNixCKOBVzVf1kwL6eYRBs1EQLo)
+ssh yourserver
+
 ```
 
 The server is Ubuntu 24.04.4 LTS with kernel 6.17.0-14-generic.
