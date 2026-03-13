@@ -1,6 +1,11 @@
-# Binaries
+# Binaries (standard)
 cpu_baseline/cpu_baseline
 gpu_rdma/gpu_rdma_pipeline
+
+# Binaries (live WebSocket variants)
+cpu_baseline/cpu_baseline_live
+gpu_rdma/gpu_rdma_pipeline_live
+binance_ws_test
 mini_trader/mini_trader_stream
 mini_trader/gpu_staging
 mini_trader/udp_receiver

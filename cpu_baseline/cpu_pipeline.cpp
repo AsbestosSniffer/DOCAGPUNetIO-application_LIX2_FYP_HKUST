@@ -15,12 +15,22 @@
  *   ./cpu_baseline [total_events] [batch_size] [n_symbols]
  *   ./cpu_baseline --udp [port] [batch_size]
  *   ./cpu_baseline --file [path.bin] [batch_size]
+ *   ./cpu_baseline --live [batch_size]
+ *
+ * The --live mode connects to Binance WebSocket and processes
+ * real-time trades. Requires libwebsockets and nlohmann-json.
  */
 
 #include "../common/market_event.h"
 #include "../common/benchmark.h"
 #include "../common/pnl_tracker.h"
 #include "../common/binance_feed.h"
+
+#ifdef HAS_WEBSOCKETS
+#include "../common/binance_ws_feed.h"
+#endif
+
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -216,6 +226,38 @@ int main(int argc, char** argv) {
             batch_num++;
         }
         pipeline.print_results();
+
+#ifdef HAS_WEBSOCKETS
+    } else if (argc > 1 && strcmp(argv[1], "--live") == 0) {
+        // Live Binance WebSocket mode
+        batch_size = (argc > 2) ? atoi(argv[2]) : 1000;
+
+        printf("Mode: LIVE Binance WebSocket (batch_size=%d)\n", batch_size);
+        printf("Press Ctrl+C to stop.\n\n");
+
+        CPUPipeline pipeline;
+        BinanceWSFeed feed;
+
+        // Handle Ctrl+C
+        static BinanceWSFeed* g_feed = &feed;
+        signal(SIGINT, [](int) { g_feed->stop(); });
+
+        int batch_num = 0;
+        feed.on_batch = [&](const MarketEvent* events, int n) {
+            pipeline.process_batch(events, n);
+            batch_num++;
+            if (batch_num % 10 == 0) {
+                printf("[CPU LIVE] Batch %d: %d events, %d signals (%dB/%dS) | PnL=$%.4f | %.0f ev/s\n",
+                       batch_num, n, pipeline.stats.total_signals,
+                       pipeline.stats.buy_count, pipeline.stats.sell_count,
+                       pipeline.pnl.cumulative_pnl,
+                       pipeline.throughput.events_per_sec());
+            }
+        };
+
+        feed.start(batch_size);
+        pipeline.print_results();
+#endif
 
     } else {
         // Synthetic benchmark mode

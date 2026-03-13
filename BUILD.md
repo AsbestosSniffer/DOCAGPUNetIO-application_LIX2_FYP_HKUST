@@ -168,6 +168,16 @@ make gpu CUDA_ARCH=90    # For H100
 | curl | Binance data download | `curl --version` |
 | unzip | Extract downloaded archives | `unzip -v` |
 
+### Required for Live WebSocket Feed (--live mode)
+
+| Package | Purpose | Install |
+|---------|---------|---------|
+| libwebsockets-dev | WebSocket client (TLS/WSS) | `sudo apt install libwebsockets-dev` |
+| nlohmann-json3-dev | JSON parsing (Binance messages) | `sudo apt install nlohmann-json3-dev` |
+| libssl-dev | TLS for WSS connections | `sudo apt install libssl-dev` |
+
+Build live variants with: `make live`
+
 ### Required for System 3 (DOCA)
 
 | Package | Purpose | Check |

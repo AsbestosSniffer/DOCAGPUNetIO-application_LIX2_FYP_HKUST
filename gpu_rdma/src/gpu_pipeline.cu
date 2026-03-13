@@ -14,12 +14,19 @@
  *   ./gpu_rdma_pipeline [total_events] [batch_size]
  *   ./gpu_rdma_pipeline --udp [port] [batch_size]
  *   ./gpu_rdma_pipeline --file [path.bin] [batch_size]
+ *   ./gpu_rdma_pipeline --live [batch_size]
  */
 
 #include "../../common/market_event.h"
 #include "../../common/benchmark.h"
 #include "../../common/pnl_tracker.h"
 #include "../../common/binance_feed.h"
+
+#ifdef HAS_WEBSOCKETS
+#include "../../common/binance_ws_feed.h"
+#endif
+
+#include <csignal>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -324,6 +331,36 @@ int main(int argc, char** argv) {
             pipeline.process_batch(batch.data(), n);
         }
         pipeline.print_results();
+
+#ifdef HAS_WEBSOCKETS
+    } else if (argc > 1 && strcmp(argv[1], "--live") == 0) {
+        batch_size = (argc > 2) ? atoi(argv[2]) : 1000;
+
+        printf("Mode: LIVE Binance WebSocket (batch_size=%d, GPU 1)\n", batch_size);
+        printf("Press Ctrl+C to stop.\n\n");
+
+        GPURDMAPipeline pipeline(batch_size);
+        BinanceWSFeed feed;
+
+        static BinanceWSFeed* g_feed = &feed;
+        signal(SIGINT, [](int) { g_feed->stop(); });
+
+        int batch_num = 0;
+        feed.on_batch = [&](const MarketEvent* events, int n) {
+            pipeline.process_batch(events, n);
+            batch_num++;
+            if (batch_num % 10 == 0) {
+                printf("[GPU LIVE] Batch %d: %d events, %d signals (%dB/%dS) | PnL=$%.4f | %.0f ev/s\n",
+                       batch_num, n, pipeline.h_stats->total_signals,
+                       pipeline.h_stats->buy_count, pipeline.h_stats->sell_count,
+                       pipeline.pnl.cumulative_pnl,
+                       pipeline.throughput.events_per_sec());
+            }
+        };
+
+        feed.start(batch_size);
+        pipeline.print_results();
+#endif
 
     } else {
         total_events = (argc > 1) ? atoi(argv[1]) : 1000000;

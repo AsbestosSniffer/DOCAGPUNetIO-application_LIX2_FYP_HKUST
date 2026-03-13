@@ -13,9 +13,10 @@ This guide covers every way to test the three systems, from quick smoke tests to
 5. [Real Data: Test with Historical Data](#5-real-data-test)
 6. [UDP Replay Testing](#6-udp-replay-testing)
 7. [Full Benchmark Suite](#7-full-benchmark-suite)
-8. [DOCA GPUNetIO Testing](#8-doca-testing)
-9. [Understanding the Output](#9-understanding-output)
-10. [Troubleshooting](#10-troubleshooting)
+8. [Live Binance WebSocket Testing](#8-live-binance-websocket-testing)
+9. [DOCA GPUNetIO Testing](#9-doca-testing)
+10. [Understanding the Output](#10-understanding-output)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -375,7 +376,135 @@ For specific parameter combinations:
 
 ---
 
-## 8. DOCA GPUNetIO Testing
+## 8. Live Binance WebSocket Testing
+
+**Time**: Ongoing (real-time). **Purpose**: Process live market data from Binance.
+
+This requires the "live" build variants which link against libwebsockets and nlohmann-json.
+
+### Prerequisites
+
+```bash
+# Install dependencies
+sudo apt install libwebsockets-dev nlohmann-json3-dev
+
+# Verify
+pkg-config --modversion libwebsockets
+dpkg -l | grep nlohmann
+```
+
+### Build Live Variants
+
+```bash
+# Build everything with WebSocket support
+make live
+
+# This creates:
+#   binance_ws_test              — standalone WS test (prints trades)
+#   cpu_baseline/cpu_baseline_live    — CPU pipeline + --live mode
+#   gpu_rdma/gpu_rdma_pipeline_live  — GPU pipeline + --live mode
+```
+
+Note: `make all` builds the standard variants WITHOUT WebSocket dependency. `make live` builds separate binaries WITH WebSocket support. This keeps the standard builds simple and dependency-free.
+
+### Step 1: Test WebSocket Connectivity
+
+```bash
+# Quick test: connect and print first 100 trades
+./binance_ws_test --dump 100
+```
+
+**Expected output:**
+```
+Binance WebSocket Live Feed Test
+
+[BinanceWS] Connecting to stream.binance.com:9443...
+[BinanceWS] Connected. Streaming 10 symbols.
+[BinanceWS] Batch size: 100 events
+[BTCUSDT] BUY   price=85234.5600  qty=0.001200  trade_id=3847562891
+[ETHUSDT] SELL  price=3215.4300  qty=0.050000  trade_id=2934781234
+[SOLUSDT] BUY   price=145.2800  qty=1.230000  trade_id=892347123
+...
+--- 100 events in 4.2s (23 ev/s) ---
+
+=== Final Statistics ===
+[Live Feed] 100 events in 1 batches  24 ev/s
+```
+
+### Step 2: Save Live Data to Binary File
+
+```bash
+# Record 10,000 live trades to a binary file
+./binance_ws_test --bin live_trades.bin --dump 10000
+
+# Then use the binary file with standard pipelines (no WS dependency)
+./cpu_baseline/cpu_baseline --file live_trades.bin 1000
+./gpu_rdma/gpu_rdma_pipeline --file live_trades.bin 1000
+```
+
+This is useful for capturing live data once, then benchmarking repeatedly on the same dataset.
+
+### Step 3: Run CPU Pipeline on Live Data
+
+```bash
+./cpu_baseline/cpu_baseline_live --live 500
+# Processes in batches of 500 events
+# Press Ctrl+C to stop
+
+# Expected output:
+# Mode: LIVE Binance WebSocket (batch_size=500)
+# [BinanceWS] Connecting to stream.binance.com:9443...
+# [BinanceWS] Connected. Streaming 10 symbols.
+# [CPU LIVE] Batch 10: 500 events, 3 signals (2B/1S) | PnL=$0.0000 | 1205 ev/s
+# [CPU LIVE] Batch 20: 500 events, 2 signals (1B/1S) | PnL=$0.0012 | 1198 ev/s
+# ...
+```
+
+### Step 4: Run GPU Pipeline on Live Data
+
+```bash
+./gpu_rdma/gpu_rdma_pipeline_live --live 500
+# Same as CPU but processes on GPU 1
+# Press Ctrl+C to stop
+```
+
+### Step 5: Side-by-Side Live Comparison
+
+Run both in separate terminals on the same live data stream:
+
+**Terminal 1:**
+```bash
+./cpu_baseline/cpu_baseline_live --live 500
+```
+
+**Terminal 2:**
+```bash
+./gpu_rdma/gpu_rdma_pipeline_live --live 500
+```
+
+Both connect to Binance independently. The data will be slightly different (different trade batches) but the overall statistics should be comparable.
+
+### Expected Live Data Rates
+
+Binance trade rates vary by market conditions:
+- **Quiet market**: ~500-2000 trades/minute across 10 symbols (~8-33 trades/sec)
+- **Active market**: ~5000-20000 trades/minute (~83-333 trades/sec)
+- **Volatile/news event**: ~50000+ trades/minute (~800+ trades/sec)
+
+With batch_size=500, you'll see a new batch every 15-60 seconds in quiet markets, or every 1-5 seconds during active trading.
+
+### Two Approaches: Download vs Live
+
+| Approach | Command | Pros | Cons |
+|----------|---------|------|------|
+| **Download + Replay** | `binance_downloader.sh` then `--file` | Reproducible benchmarks, no network needed during test, exact same data for CPU vs GPU | Historical only, requires download step |
+| **Live WebSocket** | `--live` mode | Real-time data, no download step, demonstrates live capability | Non-reproducible, different data per run, depends on network |
+
+**Recommendation**: Use downloaded data for benchmarks (reproducibility). Use live data for demos and the final presentation.
+
+---
+
+## 9. DOCA GPUNetIO Testing (Server Only)
 
 ### Stub Mode (Without DOCA SDK)
 
@@ -433,7 +562,7 @@ ibstat    # or: ip link show
 
 ---
 
-## 9. Understanding the Output
+## 10. Understanding the Output
 
 ### Latency Statistics
 
@@ -495,7 +624,7 @@ Higher events/sec is better. This measures total events divided by wall-clock ti
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Build Issues
 
