@@ -187,9 +187,12 @@ def compute_duration(min_events: int, rates: list[int], base_duration: int) -> i
 def run_harness(build_dir: Path, csv_dir: Path, results_path: Path,
                 rates: list[int], tiers: list[int], warmup: int,
                 duration: int, reps: int):
-    harness = build_dir / "benchmark_harness"
-    if not harness.exists():
-        raise FileNotFoundError(f"benchmark_harness not found in {build_dir}")
+    candidates = [build_dir / "benchmark_harness",
+                  build_dir / "bin" / "benchmark_harness"]
+    harness = next((p for p in candidates if p.exists()), None)
+    if harness is None:
+        raise FileNotFoundError(
+            f"benchmark_harness not found in {build_dir} or {build_dir / 'bin'}")
 
     args = [str(harness),
             "--csv-dir", str(csv_dir),
