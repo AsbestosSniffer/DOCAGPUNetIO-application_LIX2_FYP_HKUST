@@ -107,6 +107,12 @@ def parse_args():
                         help="Minimum events per run; duration will be computed from the slowest rate")
     parser.add_argument("--duration", type=int, default=120,
                         help="Minimum measurement duration in seconds")
+    parser.add_argument("--gpu-pcie", default="",
+                        help="PCIe address of the GPU for T4/T5 DOCA runs")
+    parser.add_argument("--nic-pcie", default="",
+                        help="PCIe address of the NIC for T4/T5 DOCA runs")
+    parser.add_argument("--skip-missing-tiers", action="store_true",
+                        help="Skip tiers whose receiver binary is not available")
     parser.add_argument("--workloads", default="real,synthetic",
                         help="Comma-separated workload names to run")
     parser.add_argument("--dashboard", action="store_true",
@@ -186,7 +192,8 @@ def compute_duration(min_events: int, rates: list[int], base_duration: int) -> i
 
 def run_harness(build_dir: Path, csv_dir: Path, results_path: Path,
                 rates: list[int], tiers: list[int], warmup: int,
-                duration: int, reps: int):
+                duration: int, reps: int,
+                gpu_pcie: str = "", nic_pcie: str = ""):
     candidates = [build_dir / "benchmark_harness",
                   build_dir / "bin" / "benchmark_harness",
                   Path("bin") / "benchmark_harness"]
@@ -203,6 +210,10 @@ def run_harness(build_dir: Path, csv_dir: Path, results_path: Path,
             "--rates", ','.join(str(r) for r in rates),
             "--tiers", ','.join(str(t) for t in tiers),
             "--reps", str(reps)]
+    if gpu_pcie:
+        args.extend(["--gpu-pcie", gpu_pcie])
+    if nic_pcie:
+        args.extend(["--nic-pcie", nic_pcie])
 
     print(f"\nRunning harness: tiers={tiers} rates={rates} reps={reps} duration={duration}s\n")
     run_command(args, cwd=build_dir)
@@ -289,6 +300,24 @@ def main():
     tiers = parse_int_list(args.tiers)
     stress_tiers = parse_int_list(args.stress_tiers)
 
+    if args.skip_missing_tiers:
+        bin_dir = build_dir / "bin"
+        binary_names = {1: "cpu_receiver", 2: "dpdk_receiver", 3: "rdma_receiver", 4: "gpu_receiver", 5: "gpu_receiver"}
+        available_tiers = []
+        missing_tiers = []
+        for t in tiers:
+            if (bin_dir / binary_names[t]).exists():
+                available_tiers.append(t)
+            else:
+                missing_tiers.append(t)
+        if missing_tiers:
+            print(f"[warning] skipping tiers with missing receiver binaries: {missing_tiers}")
+            tiers = available_tiers
+
+    if any(t in GPUNETIO_TIERS for t in tiers) and (not args.gpu_pcie or not args.nic_pcie):
+        print("[error] T4/T5 DOCA runs require --gpu-pcie and --nic-pcie. Add these or remove tiers 4/5.")
+        sys.exit(1)
+
     if not args.skip_harness:
         for workload in workloads:
             workload_dir = base_results_dir / workload
@@ -300,7 +329,8 @@ def main():
 
             duration = compute_duration(args.min_events, rates, args.duration)
             run_harness(build_dir, csv_dir, workload_dir / "benchmark.csv",
-                        rates, tiers, args.warmup, duration, args.reps)
+                        rates, tiers, args.warmup, duration, args.reps,
+                        gpu_pcie=args.gpu_pcie, nic_pcie=args.nic_pcie)
 
             if stress_rates and stress_tiers:
                 stress_duration = max(args.duration, ceil(args.min_events / float(min(stress_rates))))

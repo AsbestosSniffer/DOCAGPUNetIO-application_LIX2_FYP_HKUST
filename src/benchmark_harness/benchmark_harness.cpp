@@ -82,6 +82,9 @@ static const char *receiver_binary(int tier)
     }
 }
 
+static std::string gpu_pcie = "";
+static std::string nic_pcie = "";
+
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
 {
@@ -92,6 +95,14 @@ static std::vector<std::string> receiver_args(int tier)
         /* T5: adapter is on DPU, GPU binary is the same */
         args.push_back("--tier");
         args.push_back("5");
+    }
+    if ((tier == 4 || tier == 5) && !gpu_pcie.empty()) {
+        args.push_back("--gpu-pcie");
+        args.push_back(gpu_pcie);
+    }
+    if ((tier == 4 || tier == 5) && !nic_pcie.empty()) {
+        args.push_back("--nic-pcie");
+        args.push_back(nic_pcie);
     }
     return args;
 }
@@ -317,6 +328,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--reps")     && i+1<argc) reps         = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--tiers")    && i+1<argc) tiers_str    = argv[++i];
         else if (!strcmp(argv[i],"--rates")    && i+1<argc) rates_str    = argv[++i];
+        else if (!strcmp(argv[i],"--gpu-pcie") && i+1<argc) gpu_pcie     = argv[++i];
+        else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) nic_pcie     = argv[++i];
     }
 
     /* Parse tier list */
