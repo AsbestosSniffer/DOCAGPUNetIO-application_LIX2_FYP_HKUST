@@ -1,153 +1,233 @@
-# ═══════════════════════════════════════════════════════════════════════
-#  FYP Top-Level Makefile — DOCA GPUNetIO Trading System
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Five-Tier GPU Tick Pipeline — Top-Level Makefile
+#  Target machine: Ubuntu 24, NVIDIA A2 (sm_86), BlueField-3 DPU
+# ═══════════════════════════════════════════════════════════════════════════════
 #
-# Standard targets (no WebSocket dependency):
-#   make cpu        — Build System 1 (CPU baseline): synthetic, file, UDP modes
-#   make gpu        — Build System 2 (GPU RDMA pipeline): synthetic, file, UDP modes
-#   make tools      — Build converter + replayer (from mini_trader/)
-#   make all        — Build cpu + gpu + tools
+#  Core targets (no special hardware — usable on any CUDA-capable machine):
+#    make core        — data_source + cpu_receiver + fill_simulator + harness
+#    make data_source — T0: replay/live data generator
+#    make t1          — T1: CPU naive receiver (recvfrom + cudaMemcpy)
+#    make fill_sim    — Fill simulator (FIFO P&L tracker)
+#    make harness     — Benchmark harness (75-run coordinator)
 #
-# Live WebSocket targets (requires libwebsockets + nlohmann-json):
-#   make cpu-live   — Build CPU baseline with --live mode (Binance WebSocket)
-#   make gpu-live   — Build GPU RDMA with --live mode (Binance WebSocket)
-#   make ws-test    — Build standalone WebSocket test client
-#   make live       — Build all live variants
+#  Hardware-dependent targets:
+#    make t2          — T2: DPDK poll-mode receiver (needs DPDK)
+#    make t3          — T3: GPU RDMA receiver (needs libibverbs + nv_peer_mem)
+#    make t4          — T4/T5: GPUNetIO receiver (needs DOCA SDK)
 #
-# Other targets:
-#   make doca       — Build System 3 (DOCA GPUNetIO) — requires DOCA SDK
-#   make bench      — Run benchmark suite
-#   make clean      — Remove all binaries
+#  Convenience:
+#    make all         — core + t2 + t3 + t4 (attempts all, skips missing deps)
+#    make bench       — run quick benchmark after building core
+#    make clean       — remove bin/
 #
-# GPU selection: defaults to GPU 1 (sm_86 for A2).
-# Override with: make gpu CUDA_ARCH=86
+#  Build variables (override on command line):
+#    CUDA_ARCH=86     GPU compute capability (default: 86 for NVIDIA A2)
+#    DOCA_ROOT=/opt/mellanox/doca   (default)
+#    DPDK_ROOT=/usr/local           (default)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-NVCC      = nvcc
-CXX       = g++
-CXXFLAGS  = -O3 -std=c++17 -Wall
-NVCCFLAGS = -O3 -std=c++17
+NVCC      := nvcc
+CXX       := g++
+CXXFLAGS  := -O3 -std=c++17 -Wall -Wextra -pthread
+NVCCFLAGS := -O3 -std=c++17 -Xcompiler -Wall
+
 CUDA_ARCH ?= 86
+ARCH_FLAG := -arch=sm_$(CUDA_ARCH)
 
-COMMON    = common
+COMMON    := src/common
+BINDIR    := bin
 
-# WebSocket libraries (for live targets)
-WS_LIBS   = -lwebsockets -lssl -lcrypto -lpthread
-WS_FLAGS  = -DHAS_WEBSOCKETS
+# WebSocket support for --mode live (requires libwebsockets)
+WS_LIBS   := -lwebsockets -lssl -lcrypto -lpthread
+WS_FLAGS  := -DENABLE_LIVE_FEED
 
-# ═══════════════════════════════════════════════════════════════════════
-#  STANDARD BUILDS (no WebSocket dependency)
-# ═══════════════════════════════════════════════════════════════════════
+# DOCA SDK
+DOCA_ROOT ?= /opt/mellanox/doca
+DOCA_INC  := -I$(DOCA_ROOT)/include
+DOCA_LIBS := -L$(DOCA_ROOT)/lib/x86_64-linux-gnu \
+             -ldoca_gpunetio -ldoca_eth -ldoca_flow \
+             -ldoca_common -ldoca_argp -lcuda -lcudart
 
-# ─── System 1: CPU Baseline ───────────────────────────────────────────
-CPU_SRC = cpu_baseline/cpu_pipeline.cpp
-CPU_BIN = cpu_baseline/cpu_baseline
+# DPDK (via pkg-config)
+DPDK_CFLAGS  := $(shell pkg-config --cflags libdpdk 2>/dev/null)
+DPDK_LIBS    := $(shell pkg-config --libs   libdpdk 2>/dev/null)
 
-cpu: $(CPU_BIN)
+# ibverbs for T3 GPU RDMA
+RDMA_LIBS := -libverbs
 
-$(CPU_BIN): $(CPU_SRC) $(COMMON)/market_event.h $(COMMON)/benchmark.h $(COMMON)/pnl_tracker.h $(COMMON)/binance_feed.h
-	$(CXX) $(CXXFLAGS) -I$(COMMON) $(CPU_SRC) -o $(CPU_BIN) -lpthread
+# ── Common headers (all targets depend on these) ───────────────────────────
+COMMON_HDRS := $(COMMON)/tick_message.h     \
+               $(COMMON)/signal_result.h    \
+               $(COMMON)/benchmark_result.h \
+               $(COMMON)/benchmark.h        \
+               $(COMMON)/pnl_tracker.h
 
-# ─── System 2: GPU RDMA Pipeline ─────────────────────────────────────
-GPU_SRC = gpu_rdma/src/gpu_pipeline.cu
-GPU_BIN = gpu_rdma/gpu_rdma_pipeline
+$(BINDIR):
+	mkdir -p $(BINDIR)
 
-gpu: $(GPU_BIN)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  T0: Data source
+# ═══════════════════════════════════════════════════════════════════════════════
 
-$(GPU_BIN): $(GPU_SRC) $(COMMON)/market_event.h $(COMMON)/benchmark.h $(COMMON)/pnl_tracker.h $(COMMON)/binance_feed.h
-	$(NVCC) $(NVCCFLAGS) -arch=sm_$(CUDA_ARCH) -I$(COMMON) $(GPU_SRC) -o $(GPU_BIN)
+DATA_SRC  := src/data_source/data_source.cpp
+DATA_BIN  := $(BINDIR)/data_source
+DATA_LIVE := $(BINDIR)/data_source_live
 
-# ─── System 3: DOCA GPUNetIO (meson build, separate) ─────────────────
-doca:
-	@echo "DOCA build requires meson. Run:"
-	@echo "  cd gpu_doca && meson setup build && ninja -C build"
+data_source: $(DATA_BIN)
 
-# ─── Legacy Tools (from mini_trader/) ─────────────────────────────────
-CONVERTER_SRC = mini_trader/src/csv_to_bin_converter.cpp
-CONVERTER_BIN = mini_trader/csv_to_bin_converter
+$(DATA_BIN): $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
+	@echo "  [OK] $@"
 
-REPLAYER_SRC  = mini_trader/src/udp_replayer.cpp
-REPLAYER_BIN  = mini_trader/udp_replayer
+data_source_live: $(DATA_LIVE)
 
-LEGACY_GPU_SRC = mini_trader/src/gpu_staging.cu
-LEGACY_GPU_BIN = mini_trader/gpu_staging
+$(DATA_LIVE): $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $@ $(WS_LIBS)
+	@echo "  [OK] $@  (with Binance WebSocket)"
 
-RECEIVER_SRC  = mini_trader/src/udp_receiver.cpp
-RECEIVER_BIN  = mini_trader/udp_receiver
+# ═══════════════════════════════════════════════════════════════════════════════
+#  T1: CPU naive receiver
+# ═══════════════════════════════════════════════════════════════════════════════
 
-tools: $(CONVERTER_BIN) $(REPLAYER_BIN)
+T1_SRC := src/receivers/cpu/cpu_receiver.cu
+T1_BIN := $(BINDIR)/cpu_receiver
 
-$(CONVERTER_BIN): $(CONVERTER_SRC)
-	$(CXX) $(CXXFLAGS) -Imini_trader/include $(CONVERTER_SRC) -o $(CONVERTER_BIN)
+t1: $(T1_BIN)
 
-$(REPLAYER_BIN): $(REPLAYER_SRC)
-	$(CXX) $(CXXFLAGS) -Imini_trader/include $(REPLAYER_SRC) -o $(REPLAYER_BIN)
+$(T1_BIN): $(T1_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+	$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $< -o $@
+	@echo "  [OK] $@"
 
-legacy_gpu: $(LEGACY_GPU_BIN)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  T2: DPDK poll-mode receiver
+# ═══════════════════════════════════════════════════════════════════════════════
 
-$(LEGACY_GPU_BIN): $(LEGACY_GPU_SRC)
-	$(NVCC) $(NVCCFLAGS) -arch=sm_$(CUDA_ARCH) -Imini_trader/include $(LEGACY_GPU_SRC) -o $(LEGACY_GPU_BIN)
+T2_SRC := src/receivers/dpdk/dpdk_receiver.cu
+T2_BIN := $(BINDIR)/dpdk_receiver
 
-legacy_receiver: $(RECEIVER_BIN)
+t2: $(T2_BIN)
 
-$(RECEIVER_BIN): $(RECEIVER_SRC)
-	$(NVCC) $(NVCCFLAGS) -arch=sm_$(CUDA_ARCH) -Imini_trader/include -x cu $(RECEIVER_SRC) -o $(RECEIVER_BIN)
+$(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+	@if [ -z "$(DPDK_LIBS)" ]; then \
+		echo "  [SKIP] T2: libdpdk not found (run: apt install dpdk-dev)"; \
+	else \
+		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
+		    -Xcompiler "$(DPDK_CFLAGS)" \
+		    $< -o $@ -Xlinker "$(DPDK_LIBS)" || \
+		{ echo "  [FAIL] T2: compilation failed"; exit 0; }; \
+		echo "  [OK] $@"; \
+	fi
 
-# ═══════════════════════════════════════════════════════════════════════
-#  LIVE BUILDS (with Binance WebSocket — requires libwebsockets)
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  T3: GPU RDMA receiver (libibverbs + nv_peer_mem)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── System 1: CPU Baseline + Live ────────────────────────────────────
-CPU_LIVE_BIN = cpu_baseline/cpu_baseline_live
+T3_SRC := src/receivers/rdma/rdma_receiver.cu
+T3_BIN := $(BINDIR)/rdma_receiver
 
-cpu-live: $(CPU_LIVE_BIN)
+t3: $(T3_BIN)
 
-$(CPU_LIVE_BIN): $(CPU_SRC) $(COMMON)/binance_ws_feed.h
-	$(CXX) $(CXXFLAGS) $(WS_FLAGS) -I$(COMMON) $(CPU_SRC) -o $(CPU_LIVE_BIN) $(WS_LIBS)
+$(T3_BIN): $(T3_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+	@if ! pkg-config --exists libibverbs 2>/dev/null && \
+	    ! [ -f /usr/include/infiniband/verbs.h ]; then \
+		echo "  [SKIP] T3: libibverbs not found (run: apt install libibverbs-dev)"; \
+	else \
+		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
+		    $< -o $@ $(RDMA_LIBS) || \
+		{ echo "  [FAIL] T3: compilation failed"; exit 0; }; \
+		echo "  [OK] $@"; \
+	fi
 
-# ─── System 2: GPU RDMA + Live ────────────────────────────────────────
-GPU_LIVE_BIN = gpu_rdma/gpu_rdma_pipeline_live
+# ═══════════════════════════════════════════════════════════════════════════════
+#  T4/T5: GPUNetIO receiver (DOCA SDK required)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-gpu-live: $(GPU_LIVE_BIN)
+T4_SRC := src/receivers/gpu/gpu_receiver.cu
+T4_BIN := $(BINDIR)/gpu_receiver
 
-$(GPU_LIVE_BIN): $(GPU_SRC) $(COMMON)/binance_ws_feed.h
-	$(NVCC) $(NVCCFLAGS) -arch=sm_$(CUDA_ARCH) $(WS_FLAGS) -I$(COMMON) $(GPU_SRC) -o $(GPU_LIVE_BIN) $(WS_LIBS)
+t4: $(T4_BIN)
 
-# ─── Standalone WebSocket Test ────────────────────────────────────────
-WS_TEST_SRC = common/binance_ws_main.cpp
-WS_TEST_BIN = binance_ws_test
+$(T4_BIN): $(T4_SRC) $(COMMON_HDRS) | $(BINDIR)
+	@if [ ! -d "$(DOCA_ROOT)/include" ]; then \
+		echo "  [SKIP] T4/T5: DOCA SDK not found at $(DOCA_ROOT)"; \
+		echo "         Install DOCA SDK or set DOCA_ROOT=/path/to/doca"; \
+	else \
+		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $(DOCA_INC) \
+		    -DALLOW_EXPERIMENTAL_API \
+		    $< -o $@ $(DOCA_LIBS) || \
+		{ echo "  [FAIL] T4: compilation failed"; exit 0; }; \
+		echo "  [OK] $@  (T4 + T5 share this binary)"; \
+	fi
 
-ws-test: $(WS_TEST_BIN)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fill simulator
+# ═══════════════════════════════════════════════════════════════════════════════
 
-$(WS_TEST_BIN): $(WS_TEST_SRC) $(COMMON)/binance_ws_feed.h
-	$(CXX) $(CXXFLAGS) $(WS_FLAGS) -I$(COMMON) $(WS_TEST_SRC) -o $(WS_TEST_BIN) $(WS_LIBS)
+FILL_SRC := src/fill_simulator/fill_simulator.cpp
+FILL_BIN := $(BINDIR)/fill_simulator
 
-# ═══════════════════════════════════════════════════════════════════════
-#  AGGREGATE TARGETS
-# ═══════════════════════════════════════════════════════════════════════
+fill_sim: $(FILL_BIN)
 
-all: cpu gpu tools
+$(FILL_BIN): $(FILL_SRC) $(COMMON_HDRS) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
+	@echo "  [OK] $@"
 
-live: cpu-live gpu-live ws-test
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Benchmark harness
+# ═══════════════════════════════════════════════════════════════════════════════
 
-everything: all live
+HARNESS_SRC := src/benchmark_harness/benchmark_harness.cpp
+HARNESS_BIN := $(BINDIR)/benchmark_harness
 
-# ─── Benchmark ───────────────────────────────────────────────────────
-bench: all
-	chmod +x benchmark/run_benchmarks.sh
-	benchmark/run_benchmarks.sh quick
+harness: $(HARNESS_BIN)
 
-bench-full: all
-	chmod +x benchmark/run_benchmarks.sh
-	benchmark/run_benchmarks.sh full
+$(HARNESS_BIN): $(HARNESS_SRC) $(COMMON_HDRS) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
+	@echo "  [OK] $@"
 
-# ─── Clean ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Aggregate targets
+# ═══════════════════════════════════════════════════════════════════════════════
+
+core: data_source t1 fill_sim harness
+	@echo ""
+	@echo "  Core pipeline built.  Binaries in $(BINDIR)/"
+	@echo "  Run: make bench  to validate end-to-end"
+
+all: core t2 t3 t4
+	@echo ""
+	@echo "  Full build complete."
+
+# ── Quick end-to-end validation (replay mode, T1 only) ────────────────────
+bench: core
+	@echo ""
+	@echo "  Starting 10s pipeline smoke test (T1, replay mode)..."
+	@echo "  Terminal 1 (harness)  : $(BINDIR)/benchmark_harness --tiers 1 --rates 10000 --reps 1"
+	@echo "  Terminal 2 (receiver) : $(BINDIR)/cpu_receiver --tier 1"
+	@echo "  Terminal 3 (source)   : $(BINDIR)/data_source --mode replay --rate 10000"
+	@echo "  Terminal 4 (fill sim) : $(BINDIR)/fill_simulator"
+	@echo ""
+	@echo "  Or use scripts/pipeline_test.py for a single-process test."
+
+# ── Dashboard ─────────────────────────────────────────────────────────────
+dashboard:
+	@python3 src/dashboard/dashboard.py --results results/benchmark.csv
+
+# ── Sync to DPU (T5: cross-compiled data_source_dpu) ──────────────────────
+# Cross-compilation target for the BlueField-3 ARM cores.
+# Requires: apt install g++-aarch64-linux-gnu
+DPU_CXX   := aarch64-linux-gnu-g++
+DPU_FLAGS := -O3 -std=c++17 -static-libstdc++
+DPU_BIN   := $(BINDIR)/data_source_dpu
+
+data_source_dpu: $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+	$(DPU_CXX) $(DPU_FLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $(DPU_BIN) $(WS_LIBS)
+	@echo "  [OK] $(DPU_BIN)  (aarch64 — deploy to DPU with scp)"
+
+# ── Clean ──────────────────────────────────────────────────────────────────
 clean:
-	rm -f $(CPU_BIN) $(GPU_BIN) $(CONVERTER_BIN) $(REPLAYER_BIN)
-	rm -f $(CPU_LIVE_BIN) $(GPU_LIVE_BIN) $(WS_TEST_BIN)
-	rm -f $(LEGACY_GPU_BIN) $(RECEIVER_BIN)
-	rm -f mini_trader/mini_trader_stream mini_trader/results_logger
-	rm -rf gpu_doca/build/
+	rm -rf $(BINDIR)/
 
-.PHONY: all cpu gpu doca tools legacy_gpu legacy_receiver
-.PHONY: cpu-live gpu-live ws-test live everything
-.PHONY: bench bench-full clean
+.PHONY: all core bench clean dashboard
+.PHONY: data_source data_source_live data_source_dpu
+.PHONY: t1 t2 t3 t4 fill_sim harness

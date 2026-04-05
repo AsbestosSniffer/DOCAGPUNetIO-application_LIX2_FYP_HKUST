@@ -1,40 +1,40 @@
-# Binaries (standard)
-cpu_baseline/cpu_baseline
-gpu_rdma/gpu_rdma_pipeline
-
-# Binaries (live WebSocket variants)
-cpu_baseline/cpu_baseline_live
-gpu_rdma/gpu_rdma_pipeline_live
-binance_ws_test
-mini_trader/mini_trader_stream
-mini_trader/gpu_staging
-mini_trader/udp_receiver
-mini_trader/udp_replayer
-mini_trader/csv_to_bin_converter
-mini_trader/results_logger
-
-# Data files (too large for git)
-*.bin
-*.csv
-!requirements.txt
-
-# Build artifacts
-gpu_doca/build/
+# Build outputs
+build/
+cmake-build-*/
 *.o
+*.a
+*.so
 *.d
 
-# Benchmark results (generated)
-benchmark/results/
+# Compiled binaries
+src/data_source/data_source
+src/receivers/cpu/cpu_receiver
+src/receivers/dpdk/dpdk_receiver
+src/receivers/rdma/rdma_receiver
+src/receivers/gpu/gpu_receiver
+src/fill_simulator/fill_simulator
+src/benchmark_harness/benchmark_harness
+
+# Benchmark results
+results/
+*.csv
+*.json
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+venv/
 .venv/
+backtest_results/
+backtest.log
 
-# IDE
+# Editors
 .vscode/
 .idea/
+*.swp
+*~
 
-# OS
-.DS_Store
-Thumbs.db
+# CUDA
+*.ptx
+*.cubin
