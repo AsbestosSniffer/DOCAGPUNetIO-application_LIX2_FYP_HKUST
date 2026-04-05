@@ -83,8 +83,8 @@ class Summary:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run the full ingress benchmarking suite for this project")
-    parser.add_argument("--build-dir", default="build",
-                        help="Build directory containing benchmark_harness")
+    parser.add_argument("--build-dir", default=".",
+                        help="Build directory containing benchmark_harness (default: project root)")
     parser.add_argument("--real-csv", default=None,
                         help="Path to a real-market replay CSV for the real workload")
     parser.add_argument("--csv-dir", default="data",
@@ -276,6 +276,10 @@ def run_dashboard(results_path: Path, out_dir: Path):
 def main():
     args = parse_args()
     build_dir = Path(args.build_dir).resolve()
+    if not build_dir.exists():
+        fallback = Path('.').resolve()
+        print(f"[warning] build dir {build_dir} does not exist, falling back to {fallback}")
+        build_dir = fallback
     base_results_dir = Path(args.results_dir).resolve()
     csv_dir = Path(args.csv_dir).resolve()
     real_csv = Path(args.real_csv).resolve() if args.real_csv else None
