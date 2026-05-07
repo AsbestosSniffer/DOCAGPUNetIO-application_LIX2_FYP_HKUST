@@ -27,11 +27,19 @@
 #include <string.h>
 #include <pthread.h>
 
+#include <nvToolsExt.h>
+
 #include "common.h"
 #include "tcp_cpu/tcp_session_table.h"
 #include "tcp_cpu/tcp_cpu_rss_func.h"
 
 #define SLEEP_IN_NANOS (10 * 1000) /* Sample the PE every 10 microseconds  */
+
+/* Number of PE poll latency samples to collect before reporting */
+#define PE_POLL_SAMPLES 1000
+
+/* Path for the per-second throughput CSV written by stats_core */
+#define STATS_CSV_PATH "profiling_stats.csv"
 #define FLOW_PORT_0 0
 
 DOCA_LOG_REGISTER(GPU_PACKET_PROCESSING);
@@ -41,8 +49,8 @@ static struct doca_gpu *gpu_dev;
 static struct app_gpu_cfg app_cfg = {0};
 static struct doca_dev *ddev;
 static uint16_t flow_port_id;
-static struct rxq_udp_queues udp_queues;
-static struct rxq_tcp_queues tcp_queues;
+static struct rxq_udp_queues udp_queues = {.timing_buf_gpu = NULL, .timing_buf_cpu = NULL};
+static struct rxq_tcp_queues tcp_queues = {.timing_buf_gpu = NULL, .timing_buf_cpu = NULL};
 static struct rxq_icmp_queues icmp_queues;
 static struct txq_http_queues http_queues;
 static struct doca_flow_port *df_port;
@@ -129,16 +137,33 @@ static void *stats_core(void *args)
 	enum doca_gpu_semaphore_status status;
 	struct stats_udp udp_st[MAX_QUEUES] = {0};
 	struct stats_tcp tcp_st[MAX_QUEUES] = {0};
+	/* Per-interval deltas for throughput CSV */
+	struct stats_udp udp_delta[MAX_QUEUES] = {0};
+	struct stats_tcp tcp_delta[MAX_QUEUES] = {0};
 	uint32_t sem_idx_udp[MAX_QUEUES] = {0};
 	uint32_t sem_idx_tcp[MAX_QUEUES] = {0};
 	uint64_t start_time_sec = 0;
 	uint64_t interval_print = 0;
 	uint64_t interval_sec = 0;
+	uint64_t elapsed_sec = 0;
 	struct stats_udp *custom_udp_st;
 	struct stats_tcp *custom_tcp_st;
 	pthread_t self_id = pthread_self();
+	FILE *csv_fp = NULL;
 
-	DOCA_LOG_INFO("Thread %lu is reporting filter stats", (unsigned long)self_id);
+	/* Open CSV for per-second throughput data (profiling output) */
+	csv_fp = fopen(STATS_CSV_PATH, "w");
+	if (csv_fp) {
+		fprintf(csv_fp,
+			"elapsed_sec,udp_total,udp_dns,udp_other,"
+			"tcp_total,tcp_http,tcp_http_get,tcp_syn,tcp_fin,tcp_ack\n");
+		fflush(csv_fp);
+	} else {
+		DOCA_LOG_WARN("Could not open %s for writing; CSV output disabled", STATS_CSV_PATH);
+	}
+
+	DOCA_LOG_INFO("Thread %lu is reporting filter stats (1-second CSV: %s)",
+		      (unsigned long)self_id, STATS_CSV_PATH);
 	get_ns(&start_time_sec);
 	interval_print = get_ns(&interval_sec);
 	while (DOCA_GPUNETIO_VOLATILE(force_quit) == false) {
@@ -159,9 +184,12 @@ static void *stats_core(void *args)
 					goto error;
 				}
 
-				udp_st[idxq].dns += custom_udp_st->dns;
+				udp_delta[idxq].dns    += custom_udp_st->dns;
+				udp_delta[idxq].others += custom_udp_st->others;
+				udp_delta[idxq].total  += custom_udp_st->total;
+				udp_st[idxq].dns    += custom_udp_st->dns;
 				udp_st[idxq].others += custom_udp_st->others;
-				udp_st[idxq].total += custom_udp_st->total;
+				udp_st[idxq].total  += custom_udp_st->total;
 
 				result = doca_gpu_semaphore_set_status(udp_queues.sem_cpu[idxq],
 								       sem_idx_udp[idxq],
@@ -192,15 +220,22 @@ static void *stats_core(void *args)
 					goto error;
 				}
 
-				tcp_st[idxq].http += custom_tcp_st->http;
+				tcp_delta[idxq].http      += custom_tcp_st->http;
+				tcp_delta[idxq].http_get  += custom_tcp_st->http_get;
+				tcp_delta[idxq].tcp_syn   += custom_tcp_st->tcp_syn;
+				tcp_delta[idxq].tcp_fin   += custom_tcp_st->tcp_fin;
+				tcp_delta[idxq].tcp_ack   += custom_tcp_st->tcp_ack;
+				tcp_delta[idxq].others    += custom_tcp_st->others;
+				tcp_delta[idxq].total     += custom_tcp_st->total;
+				tcp_st[idxq].http      += custom_tcp_st->http;
 				tcp_st[idxq].http_head += custom_tcp_st->http_head;
-				tcp_st[idxq].http_get += custom_tcp_st->http_get;
+				tcp_st[idxq].http_get  += custom_tcp_st->http_get;
 				tcp_st[idxq].http_post += custom_tcp_st->http_post;
-				tcp_st[idxq].tcp_syn += custom_tcp_st->tcp_syn;
-				tcp_st[idxq].tcp_fin += custom_tcp_st->tcp_fin;
-				tcp_st[idxq].tcp_ack += custom_tcp_st->tcp_ack;
-				tcp_st[idxq].others += custom_tcp_st->others;
-				tcp_st[idxq].total += custom_tcp_st->total;
+				tcp_st[idxq].tcp_syn   += custom_tcp_st->tcp_syn;
+				tcp_st[idxq].tcp_fin   += custom_tcp_st->tcp_fin;
+				tcp_st[idxq].tcp_ack   += custom_tcp_st->tcp_ack;
+				tcp_st[idxq].others    += custom_tcp_st->others;
+				tcp_st[idxq].total     += custom_tcp_st->total;
 
 				result = doca_gpu_semaphore_set_status(tcp_queues.sem_cpu[idxq],
 								       sem_idx_tcp[idxq],
@@ -214,9 +249,39 @@ static void *stats_core(void *args)
 			}
 		}
 
-		if ((get_ns(&interval_sec) - interval_print) > 5000000000) {
-			printf("\nSeconds %ld\n", interval_sec - start_time_sec);
+		/* Print and record every 1 second (down from original 5 seconds) */
+		if ((get_ns(&interval_sec) - interval_print) > 1000000000ULL) {
+			elapsed_sec = interval_sec - start_time_sec;
 
+			/* Aggregate deltas across queues for CSV row */
+			uint64_t agg_udp_total = 0, agg_udp_dns = 0, agg_udp_other = 0;
+			uint64_t agg_tcp_total = 0, agg_tcp_http = 0, agg_tcp_get = 0;
+			uint64_t agg_tcp_syn = 0, agg_tcp_fin = 0, agg_tcp_ack = 0;
+
+			for (int idxq = 0; idxq < udp_queues.numq; idxq++) {
+				agg_udp_total += udp_delta[idxq].total;
+				agg_udp_dns   += udp_delta[idxq].dns;
+				agg_udp_other += udp_delta[idxq].others;
+			}
+			for (int idxq = 0; idxq < tcp_queues.numq; idxq++) {
+				agg_tcp_total += tcp_delta[idxq].total;
+				agg_tcp_http  += tcp_delta[idxq].http;
+				agg_tcp_get   += tcp_delta[idxq].http_get;
+				agg_tcp_syn   += tcp_delta[idxq].tcp_syn;
+				agg_tcp_fin   += tcp_delta[idxq].tcp_fin;
+				agg_tcp_ack   += tcp_delta[idxq].tcp_ack;
+			}
+
+			if (csv_fp) {
+				fprintf(csv_fp, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+					elapsed_sec,
+					agg_udp_total, agg_udp_dns, agg_udp_other,
+					agg_tcp_total, agg_tcp_http, agg_tcp_get,
+					agg_tcp_syn, agg_tcp_fin, agg_tcp_ack);
+				fflush(csv_fp);
+			}
+
+			printf("\nSeconds %lu\n", elapsed_sec);
 			for (int idxq = 0; idxq < udp_queues.numq; idxq++) {
 				printf("[UDP] QUEUE: %d DNS: %ld OTHER: %ld TOTAL: %ld\n",
 				       idxq,
@@ -224,7 +289,6 @@ static void *stats_core(void *args)
 				       udp_st[idxq].others,
 				       udp_st[idxq].total);
 			}
-
 			for (int idxq = 0; idxq < tcp_queues.numq; idxq++) {
 				printf("[TCP] QUEUE: %d HTTP: %d HTTP HEAD: %d HTTP GET: %d HTTP POST: %d TCP [SYN: %d FIN: %d ACK: %d] OTHER: %d TOTAL: %d\n",
 				       idxq,
@@ -239,13 +303,21 @@ static void *stats_core(void *args)
 				       tcp_st[idxq].total);
 			}
 
+			/* Reset per-interval deltas */
+			memset(udp_delta, 0, sizeof(udp_delta));
+			memset(tcp_delta, 0, sizeof(tcp_delta));
+
 			interval_print = get_ns(&interval_sec);
 		}
 	}
 
+	if (csv_fp)
+		fclose(csv_fp);
 	return NULL;
 
 error:
+	if (csv_fp)
+		fclose(csv_fp);
 	DOCA_GPUNETIO_VOLATILE(force_quit) = true;
 	return NULL;
 }
@@ -287,6 +359,18 @@ int main(int argc, char **argv)
 		.tv_sec = 0,
 		.tv_nsec = SLEEP_IN_NANOS,
 	};
+
+	/* Profiling: CUDA events to measure per-stream kernel wall time */
+	cudaEvent_t prof_udp_start,  prof_udp_end;
+	cudaEvent_t prof_tcp_start,  prof_tcp_end;
+	cudaEvent_t prof_icmp_start, prof_icmp_end;
+	cudaEvent_t prof_http_start, prof_http_end;
+
+	/* Profiling: PE poll interval measurement */
+	struct timespec pe_t0, pe_t1;
+	uint64_t pe_poll_sum_ns = 0;
+	uint64_t pe_poll_sum_sq_ns = 0;
+	uint32_t pe_poll_count = 0;
 
 	/* Register a logger backend */
 	result = doca_log_backend_create_standard();
@@ -471,11 +555,29 @@ int main(int argc, char **argv)
 
 	DOCA_LOG_INFO("Launching CUDA kernels");
 
+	/* Create CUDA events for per-stream kernel wall-time measurement */
+	cudaEventCreate(&prof_udp_start);  cudaEventCreate(&prof_udp_end);
+	cudaEventCreate(&prof_tcp_start);  cudaEventCreate(&prof_tcp_end);
+	cudaEventCreate(&prof_icmp_start); cudaEventCreate(&prof_icmp_end);
+	cudaEventCreate(&prof_http_start); cudaEventCreate(&prof_http_end);
+
+	/* Mark production-phase start for Nsight Systems */
+	nvtxRangePush("production");
+
+	/* Record start events before each kernel launch */
+	cudaEventRecord(prof_udp_start,  rx_udp_stream);
 	kernel_receive_udp(rx_udp_stream, gpu_exit_condition, &udp_queues);
+
+	cudaEventRecord(prof_tcp_start,  rx_tcp_stream);
 	kernel_receive_tcp(rx_tcp_stream, gpu_exit_condition, &tcp_queues, app_cfg.http_server);
+
+	cudaEventRecord(prof_icmp_start, rx_icmp_stream);
 	kernel_receive_icmp(rx_icmp_stream, gpu_exit_condition, &icmp_queues);
-	if (app_cfg.http_server)
+
+	if (app_cfg.http_server) {
+		cudaEventRecord(prof_http_start, tx_http_server);
 		kernel_http_server(tx_http_server, gpu_exit_condition, &tcp_queues, &http_queues);
+	}
 
 	/* Launch stats thread to report pipeline status */
 	if (pthread_create(&stat_thread_id, NULL, &stats_core, NULL) != 0) {
@@ -499,20 +601,137 @@ int main(int argc, char **argv)
 	DOCA_LOG_INFO("Waiting for termination");
 	/* This loop keeps busy main thread until force_quit is set to 1 (e.g. typing ctrl+c) */
 	while (DOCA_GPUNETIO_VOLATILE(force_quit) == false) {
-		doca_pe_progress(pe);
-		nanosleep(&ts, &ts);
+		/* Measure actual PE poll interval for profiling (first PE_POLL_SAMPLES iterations) */
+		if (pe_poll_count < PE_POLL_SAMPLES) {
+			clock_gettime(CLOCK_MONOTONIC, &pe_t0);
+			doca_pe_progress(pe);
+			nanosleep(&ts, &ts);
+			clock_gettime(CLOCK_MONOTONIC, &pe_t1);
+			uint64_t elapsed_ns = (uint64_t)(pe_t1.tv_sec  - pe_t0.tv_sec)  * 1000000000ULL
+					    + (uint64_t)(pe_t1.tv_nsec - pe_t0.tv_nsec);
+			pe_poll_sum_ns    += elapsed_ns;
+			pe_poll_sum_sq_ns += elapsed_ns * elapsed_ns;
+			pe_poll_count++;
+			if (pe_poll_count == PE_POLL_SAMPLES) {
+				double mean_us = (double)pe_poll_sum_ns / (PE_POLL_SAMPLES * 1000.0);
+				double mean_sq = (double)pe_poll_sum_sq_ns / PE_POLL_SAMPLES;
+				double mean_sq_val = (double)pe_poll_sum_ns / PE_POLL_SAMPLES;
+				double var_ns = mean_sq - mean_sq_val * mean_sq_val;
+				double stddev_us = (var_ns > 0 ? __builtin_sqrt(var_ns) : 0.0) / 1000.0;
+				DOCA_LOG_INFO("[PROFILING] PE poll interval over %d samples: mean=%.2f us  stddev=%.2f us  (configured: %d us)",
+					      PE_POLL_SAMPLES, mean_us, stddev_us, SLEEP_IN_NANOS / 1000);
+			}
+		} else {
+			doca_pe_progress(pe);
+			nanosleep(&ts, &ts);
+		}
 	}
 
 	DOCA_GPUNETIO_VOLATILE(*cpu_exit_condition) = 1;
+
+	/* Record end events so elapsed time can be computed after stream sync */
+	cudaEventRecord(prof_udp_end,  rx_udp_stream);
+	cudaEventRecord(prof_tcp_end,  rx_tcp_stream);
+	cudaEventRecord(prof_icmp_end, rx_icmp_stream);
+	if (app_cfg.http_server)
+		cudaEventRecord(prof_http_end, tx_http_server);
+
 	cudaStreamSynchronize(rx_udp_stream);
-	cudaStreamDestroy(rx_udp_stream);
 	cudaStreamSynchronize(rx_tcp_stream);
-	cudaStreamDestroy(rx_tcp_stream);
 	cudaStreamSynchronize(rx_icmp_stream);
-	cudaStreamDestroy(rx_icmp_stream);
-	if (app_cfg.http_server) {
+	if (app_cfg.http_server)
 		cudaStreamSynchronize(tx_http_server);
+
+	/* Close NVTX production range */
+	nvtxRangePop();
+
+	/* Report per-stream kernel wall times */
+	{
+		float ms_udp = 0, ms_tcp = 0, ms_icmp = 0, ms_http = 0;
+		cudaEventElapsedTime(&ms_udp,  prof_udp_start,  prof_udp_end);
+		cudaEventElapsedTime(&ms_tcp,  prof_tcp_start,  prof_tcp_end);
+		cudaEventElapsedTime(&ms_icmp, prof_icmp_start, prof_icmp_end);
+		DOCA_LOG_INFO("[PROFILING] Kernel wall times — UDP: %.1f ms  TCP: %.1f ms  ICMP: %.1f ms",
+			      ms_udp, ms_tcp, ms_icmp);
+		if (app_cfg.http_server) {
+			cudaEventElapsedTime(&ms_http, prof_http_start, prof_http_end);
+			DOCA_LOG_INFO("[PROFILING] HTTP server kernel wall time: %.1f ms", ms_http);
+		}
+	}
+
+	cudaEventDestroy(prof_udp_start);  cudaEventDestroy(prof_udp_end);
+	cudaEventDestroy(prof_tcp_start);  cudaEventDestroy(prof_tcp_end);
+	cudaEventDestroy(prof_icmp_start); cudaEventDestroy(prof_icmp_end);
+	cudaEventDestroy(prof_http_start); cudaEventDestroy(prof_http_end);
+
+	cudaStreamDestroy(rx_udp_stream);
+	cudaStreamDestroy(rx_tcp_stream);
+	cudaStreamDestroy(rx_icmp_stream);
+	if (app_cfg.http_server)
 		cudaStreamDestroy(tx_http_server);
+
+	/* Copy TCP intra-kernel timing ring buffer to host and write CSV */
+	if (tcp_queues.timing_buf_gpu != NULL && tcp_queues.timing_buf_cpu != NULL) {
+		size_t buf_bytes = (size_t)MAX_QUEUES * 1024 * 4 * sizeof(uint64_t);
+		cuda_ret = cudaMemcpy(tcp_queues.timing_buf_cpu, tcp_queues.timing_buf_gpu,
+				      buf_bytes, cudaMemcpyDeviceToHost);
+		if (cuda_ret == cudaSuccess) {
+			FILE *tfp = fopen("profiling_timing_tcp.csv", "w");
+			if (tfp) {
+				fprintf(tfp, "slot,t0_cycles,t1_cycles,t2_cycles,t3_cycles,"
+					"nic_wait_cycles,compute_cycles,semaphore_cycles\n");
+				uint64_t *buf = tcp_queues.timing_buf_cpu;
+				for (int s = 0; s < 1024; s++) {
+					uint64_t t0 = buf[s * 4 + 0];
+					uint64_t t1 = buf[s * 4 + 1];
+					uint64_t t2 = buf[s * 4 + 2];
+					uint64_t t3 = buf[s * 4 + 3];
+					if (t0 == 0 && t1 == 0)
+						break;
+					fprintf(tfp, "%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+						s, t0, t1, t2, t3,
+						t1 - t0, t2 - t1, t3 - t2);
+				}
+				fclose(tfp);
+				DOCA_LOG_INFO("[PROFILING] TCP intra-kernel timing written to profiling_timing_tcp.csv");
+			}
+		}
+		cudaFree(tcp_queues.timing_buf_gpu);
+		cudaFreeHost(tcp_queues.timing_buf_cpu);
+		tcp_queues.timing_buf_gpu = NULL;
+		tcp_queues.timing_buf_cpu = NULL;
+	}
+
+	/* Copy UDP intra-kernel timing ring buffer to host and write CSV */
+	if (udp_queues.timing_buf_gpu != NULL && udp_queues.timing_buf_cpu != NULL) {
+		size_t buf_bytes = (size_t)MAX_QUEUES * 1024 * 4 * sizeof(uint64_t);
+		cuda_ret = cudaMemcpy(udp_queues.timing_buf_cpu, udp_queues.timing_buf_gpu,
+				      buf_bytes, cudaMemcpyDeviceToHost);
+		if (cuda_ret == cudaSuccess) {
+			FILE *tfp = fopen("profiling_timing_udp.csv", "w");
+			if (tfp) {
+				fprintf(tfp, "slot,t0_cycles,t1_cycles,t2_cycles,t3_cycles,"
+					"nic_wait_cycles,compute_cycles,semaphore_cycles\n");
+				uint64_t *buf = udp_queues.timing_buf_cpu;
+				for (int s = 0; s < 1024; s++) {
+					uint64_t t0 = buf[s * 4 + 0];
+					uint64_t t1 = buf[s * 4 + 1];
+					uint64_t t2 = buf[s * 4 + 2];
+					uint64_t t3 = buf[s * 4 + 3];
+					if (t0 == 0 && t1 == 0)
+						break; /* unwritten slots */
+					fprintf(tfp, "%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+						s, t0, t1, t2, t3,
+						t1 - t0, t2 - t1, t3 - t2);
+				}
+				fclose(tfp);
+				DOCA_LOG_INFO("[PROFILING] UDP intra-kernel timing written to profiling_timing_udp.csv");
+			}
+		}
+		cudaFree(udp_queues.timing_buf_gpu);
+		cudaFreeHost(udp_queues.timing_buf_cpu);
+		udp_queues.timing_buf_gpu = NULL;
+		udp_queues.timing_buf_cpu = NULL;
 	}
 
 	doca_gpu_mem_free(gpu_dev, gpu_exit_condition);

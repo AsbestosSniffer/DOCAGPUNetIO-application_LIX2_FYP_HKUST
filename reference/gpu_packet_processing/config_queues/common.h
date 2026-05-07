@@ -74,6 +74,10 @@ struct rxq_tcp_queues {
 								handler*/
 	struct doca_gpu_semaphore_gpu *sem_http_gpu[MAX_QUEUES]; /* One semaphore per queue to report HTTP info, GPU
 								    handler*/
+
+	/* Profiling: clock64() ring buffer in GPU memory — same layout as rxq_udp_queues */
+	uint64_t *timing_buf_gpu;
+	uint64_t *timing_buf_cpu;
 };
 
 /* Application UDP receive queues objects */
@@ -100,6 +104,12 @@ struct rxq_udp_queues {
 	uint16_t nums;					    /* Number of semaphores items */
 	struct doca_gpu_semaphore *sem_cpu[MAX_QUEUES];	    /* One semaphore per queue, CPU handler*/
 	struct doca_gpu_semaphore_gpu *sem_gpu[MAX_QUEUES]; /* One semaphore per queue, GPU handler*/
+
+	/* Profiling: clock64() ring buffer in GPU memory (MAX_QUEUES * 1024 slots * 4 timestamps).
+	 * Filled by the UDP receive kernel; copied to host after run for analysis.
+	 */
+	uint64_t *timing_buf_gpu; /* GPU-side pointer (device memory) */
+	uint64_t *timing_buf_cpu; /* Host-side pinned copy for readback */
 };
 
 /* Application ICMP receive queues objects */

@@ -38,6 +38,13 @@
 
 DOCA_LOG_REGISTER(GPU_SANITY::KernelReceiveUdp);
 
+/* Intra-kernel timing ring buffer — slots per queue, 4 uint64_t per slot (t0..t3).
+ * Layout: timing_buf[(iter % TIMING_BUF_SLOTS) * 4 + 0..3] for block 0.
+ * Each block uses its own contiguous region: block K -> offset K*TIMING_BUF_SLOTS*4.
+ * Total size: MAX_QUEUES * TIMING_BUF_SLOTS * 4 * sizeof(uint64_t).
+ */
+#define TIMING_BUF_SLOTS 1024
+
 __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 					struct doca_gpu_eth_rxq *rxq0,
 					struct doca_gpu_eth_rxq *rxq1,
@@ -47,7 +54,8 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 					struct doca_gpu_semaphore_gpu *sem0,
 					struct doca_gpu_semaphore_gpu *sem1,
 					struct doca_gpu_semaphore_gpu *sem2,
-					struct doca_gpu_semaphore_gpu *sem3)
+					struct doca_gpu_semaphore_gpu *sem3,
+					uint64_t *timing_buf)
 {
 	__shared__ uint64_t out_first_pkt_idx;
 	__shared__ uint32_t out_pkt_num;
@@ -64,6 +72,11 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 	uint32_t lane_id = doca_gpu_dev_eth_get_lane_id();
 	uint32_t sem_idx = 0;
 	uint8_t *payload;
+	/* Timing ring buffer: each block writes to its own region */
+	uint64_t *blk_timing = (timing_buf != NULL)
+		? timing_buf + (uint64_t)blockIdx.x * TIMING_BUF_SLOTS * 4
+		: NULL;
+	uint32_t timing_iter = 0;
 
 	if (blockIdx.x == 0) {
 		rxq = rxq0;
@@ -87,8 +100,13 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 	__syncthreads();
 
 	while (DOCA_GPUNETIO_VOLATILE(*exit_cond) == 0) {
+		uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
 		stats_thread.dns = 0;
 		stats_thread.others = 0;
+
+		/* t0: before NIC receive call */
+		if (threadIdx.x == 0)
+			t0 = clock64();
 
 		/* No need to impose packet limit here as we want the max number of packets every time */
 		ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
@@ -100,6 +118,11 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 								&out_first_pkt_idx,
 								&out_pkt_num,
 								NULL);
+
+		/* t1: after NIC receive (packets now in GPU memory) */
+		if (threadIdx.x == 0)
+			t1 = clock64();
+
 		/* If any thread returns receive error, the whole execution stops */
 		if (ret != DOCA_SUCCESS) {
 			if (threadIdx.x == 0) {
@@ -137,6 +160,10 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 		}
 		__syncthreads();
 
+		/* t2: after payload inspection */
+		if (threadIdx.x == 0)
+			t2 = clock64();
+
 #pragma unroll
 		for (int offset = 16; offset > 0; offset /= 2) {
 			stats_thread.dns += __shfl_down_sync(WARP_FULL_MASK, stats_thread.dns, offset);
@@ -167,6 +194,19 @@ __global__ void cuda_kernel_receive_udp(uint32_t *exit_cond,
 			doca_gpu_dev_semaphore_set_status(sem, sem_idx, DOCA_GPU_SEMAPHORE_STATUS_READY);
 			__threadfence_system();
 
+			/* t3: after semaphore write */
+			t3 = clock64();
+
+			/* Write to timing ring buffer (block 0 only to keep overhead minimal) */
+			if (blk_timing != NULL && blockIdx.x == 0) {
+				uint32_t slot = (timing_iter % TIMING_BUF_SLOTS) * 4;
+				blk_timing[slot + 0] = t0;
+				blk_timing[slot + 1] = t1;
+				blk_timing[slot + 2] = t2;
+				blk_timing[slot + 3] = t3;
+				timing_iter++;
+			}
+
 			sem_idx = (sem_idx + 1) % sem_num;
 
 			DOCA_GPUNETIO_VOLATILE(stats_sh.dns) = 0;
@@ -188,6 +228,29 @@ doca_error_t kernel_receive_udp(cudaStream_t stream, uint32_t *exit_cond, struct
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
+	/* Allocate timing ring buffer on first call if not already done.
+	 * Layout: MAX_QUEUES * TIMING_BUF_SLOTS * 4 uint64_t values.
+	 * We only track block 0 (set in kernel), but allocate for all queues for completeness.
+	 */
+	if (udp_queues->timing_buf_gpu == NULL) {
+		size_t buf_bytes = (size_t)MAX_QUEUES * TIMING_BUF_SLOTS * 4 * sizeof(uint64_t);
+		result = cudaMalloc((void **)&udp_queues->timing_buf_gpu, buf_bytes);
+		if (result != cudaSuccess) {
+			DOCA_LOG_WARN("UDP timing buffer alloc failed (%s) — profiling disabled",
+				      cudaGetErrorString(result));
+			udp_queues->timing_buf_gpu = NULL;
+		} else {
+			cudaMemset(udp_queues->timing_buf_gpu, 0, buf_bytes);
+			result = cudaMallocHost((void **)&udp_queues->timing_buf_cpu, buf_bytes);
+			if (result != cudaSuccess) {
+				DOCA_LOG_WARN("UDP timing buffer host alloc failed — profiling disabled");
+				cudaFree(udp_queues->timing_buf_gpu);
+				udp_queues->timing_buf_gpu = NULL;
+				udp_queues->timing_buf_cpu = NULL;
+			}
+		}
+	}
+
 	/* Check no previous CUDA errors */
 	result = cudaGetLastError();
 	if (cudaSuccess != result) {
@@ -205,7 +268,8 @@ doca_error_t kernel_receive_udp(cudaStream_t stream, uint32_t *exit_cond, struct
 									       udp_queues->sem_gpu[0],
 									       udp_queues->sem_gpu[1],
 									       udp_queues->sem_gpu[2],
-									       udp_queues->sem_gpu[3]);
+									       udp_queues->sem_gpu[3],
+									       udp_queues->timing_buf_gpu);
 	result = cudaGetLastError();
 	if (cudaSuccess != result) {
 		DOCA_LOG_ERR("[%s:%d] cuda failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));

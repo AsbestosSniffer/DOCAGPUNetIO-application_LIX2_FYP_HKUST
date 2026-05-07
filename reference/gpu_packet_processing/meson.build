@@ -28,6 +28,7 @@ if not flag_enable_gpu_support
 endif
 
 app_dependencies += declare_dependency(link_args : '-lresolv')
+app_dependencies += declare_dependency(link_args : '-lnvToolsExt')
 app_dependencies += gpu_dependencies
 
 doca_gpu_dep = dependency('doca-gpunetio')

@@ -36,6 +36,12 @@
 
 DOCA_LOG_REGISTER(GPU_SANITY::KernelReceiveTcp);
 
+/* Intra-kernel timing ring buffer — same layout as the UDP kernel.
+ * Block 0 records: t0=before recv, t1=after recv, t2=after payload loop, t3=after semaphore write.
+ * Total size: MAX_QUEUES * TIMING_BUF_SLOTS_TCP * 4 * sizeof(uint64_t).
+ */
+#define TIMING_BUF_SLOTS_TCP 1024
+
 static __device__ void report_http_info(struct info_http *http_global, struct eth_ip_tcp_hdr *hdr, uint8_t *payload)
 {
 	/* Ethernet info */
@@ -88,7 +94,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					struct doca_gpu_semaphore_gpu *sem_http1,
 					struct doca_gpu_semaphore_gpu *sem_http2,
 					struct doca_gpu_semaphore_gpu *sem_http3,
-					bool http_server)
+					bool http_server,
+					uint64_t *timing_buf)
 {
 	__shared__ uint64_t out_first_pkt_idx;
 	__shared__ uint32_t out_pkt_num;
@@ -108,6 +115,10 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 	uint32_t lane_id = doca_gpu_dev_eth_get_lane_id();
 	uint32_t sem_stats_idx = 0;
 	uint8_t *payload;
+	uint64_t *blk_timing = (timing_buf != NULL)
+		? timing_buf + (uint64_t)blockIdx.x * TIMING_BUF_SLOTS_TCP * 4
+		: NULL;
+	uint32_t timing_iter = 0;
 
 	if (blockIdx.x == 0) {
 		rxq = rxq0;
@@ -142,6 +153,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 	__syncthreads();
 
 	while (DOCA_GPUNETIO_VOLATILE(*exit_cond) == 0) {
+		uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
 		stats_thread.http = 0;
 		stats_thread.http_head = 0;
 		stats_thread.http_get = 0;
@@ -150,6 +162,10 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 		stats_thread.tcp_fin = 0;
 		stats_thread.tcp_ack = 0;
 		stats_thread.others = 0;
+
+		/* t0: before NIC receive call */
+		if (threadIdx.x == 0)
+			t0 = clock64();
 
 		ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
 									DOCA_GPUNETIO_ETH_MCST_AUTO,
@@ -160,6 +176,11 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 								&out_first_pkt_idx,
 								&out_pkt_num,
 								NULL);
+
+		/* t1: after NIC receive (packets now in GPU memory) */
+		if (threadIdx.x == 0)
+			t1 = clock64();
+
 		/* If any thread returns receive error, the whole execution stops */
 		if (ret != DOCA_SUCCESS) {
 			if (threadIdx.x == 0) {
@@ -181,6 +202,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 		if (out_pkt_num == 0)
 			continue;
 
+		/* t2 will be recorded after the payload loop via a __syncthreads */
 		buf_idx = threadIdx.x;
 		while (buf_idx < out_pkt_num) {
 			buf_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(rxq, out_first_pkt_idx + buf_idx);
@@ -232,6 +254,10 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			wipe_packet_32b(payload);
 			buf_idx += blockDim.x;
 		}
+
+		/* t2: after payload inspection */
+		if (threadIdx.x == 0)
+			t2 = clock64();
 
 #pragma unroll
 		for (int offset = 16; offset > 0; offset /= 2) {
@@ -285,6 +311,17 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			doca_gpu_dev_semaphore_set_status(sem_stats, sem_stats_idx, DOCA_GPU_SEMAPHORE_STATUS_READY);
 			__threadfence_system();
 
+			/* t3: after semaphore write — record to timing ring buffer */
+			t3 = clock64();
+			if (blk_timing != NULL && blockIdx.x == 0) {
+				uint32_t slot = (timing_iter % TIMING_BUF_SLOTS_TCP) * 4;
+				blk_timing[slot + 0] = t0;
+				blk_timing[slot + 1] = t1;
+				blk_timing[slot + 2] = t2;
+				blk_timing[slot + 3] = t3;
+				timing_iter++;
+			}
+
 			sem_stats_idx = (sem_stats_idx + 1) % sem_num;
 
 			DOCA_GPUNETIO_VOLATILE(stats_sh.http) = 0;
@@ -315,6 +352,26 @@ doca_error_t kernel_receive_tcp(cudaStream_t stream,
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
+	/* Allocate TCP timing ring buffer on first call */
+	if (tcp_queues->timing_buf_gpu == NULL) {
+		size_t buf_bytes = (size_t)MAX_QUEUES * TIMING_BUF_SLOTS_TCP * 4 * sizeof(uint64_t);
+		result = cudaMalloc((void **)&tcp_queues->timing_buf_gpu, buf_bytes);
+		if (result != cudaSuccess) {
+			DOCA_LOG_WARN("TCP timing buffer alloc failed (%s) — profiling disabled",
+				      cudaGetErrorString(result));
+			tcp_queues->timing_buf_gpu = NULL;
+		} else {
+			cudaMemset(tcp_queues->timing_buf_gpu, 0, buf_bytes);
+			result = cudaMallocHost((void **)&tcp_queues->timing_buf_cpu, buf_bytes);
+			if (result != cudaSuccess) {
+				DOCA_LOG_WARN("TCP timing buffer host alloc failed — profiling disabled");
+				cudaFree(tcp_queues->timing_buf_gpu);
+				tcp_queues->timing_buf_gpu = NULL;
+				tcp_queues->timing_buf_cpu = NULL;
+			}
+		}
+	}
+
 	/* Check no previous CUDA errors */
 	result = cudaGetLastError();
 	if (cudaSuccess != result) {
@@ -337,7 +394,8 @@ doca_error_t kernel_receive_tcp(cudaStream_t stream,
 									       tcp_queues->sem_http_gpu[1],
 									       tcp_queues->sem_http_gpu[2],
 									       tcp_queues->sem_http_gpu[3],
-									       http_server);
+									       http_server,
+									       tcp_queues->timing_buf_gpu);
 	result = cudaGetLastError();
 	if (cudaSuccess != result) {
 		DOCA_LOG_ERR("[%s:%d] cuda failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));
