@@ -54,18 +54,20 @@
         fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(_e)); \
         exit(1); }} while(0)
 
-/* Mirror of TickMessage (48 bytes, matching benchmark_result.h layout) */
-struct __align__(8) TickMessage {
+/* Mirror of TickMessage — must match src/common/tick_message.h exactly */
+#pragma pack(push, 1)
+struct TickMessage {
     uint64_t timestamp_ns;
-    uint64_t tick_id;
+    uint32_t tick_id;
     uint16_t instrument_id;
     uint8_t  source;
-    uint8_t  _pad[5];
+    uint8_t  _pad;
     double   bid;
     double   ask;
     double   last_price;
     double   volume;
 };
+#pragma pack(pop)
 static_assert(sizeof(TickMessage) == 48, "TickMessage must be 48 bytes");
 
 /* Device helper: atomic double CAS update */
