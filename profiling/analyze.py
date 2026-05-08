@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-analyze.py — Post-run profiling analysis for the DOCA GPUNetIO pipeline.
+analyze.py -- Post-run profiling analysis for the DOCA GPUNetIO pipeline.
 
-Reads the CSV files produced by the instrumented application and generates
-the figures needed for the hardware profiling report:
+Reads the CSV produced by benchmark_harness (bench results) and the
+profiling_timing_gpu.csv written by gpu_receiver on shutdown, then generates
+the figures needed for the hardware profiling report.
 
-  1. Throughput time series (profiling_stats.csv)
-  2. Intra-kernel timing breakdown: NIC wait / compute / semaphore write
-     (profiling_timing_udp.csv, profiling_timing_tcp.csv)
-  3. Scalability: throughput vs queue count (if multiple stats CSVs supplied)
+Plots produced:
+  1. E2E latency CDF -- T1 vs T4 at 100k ticks/sec
+  2. E2E latency vs offered rate (p50 and p99) -- T1 vs T4
+  3. Stage breakdown stacked bar -- ingest / compute / egress per tier per rate
+  4. NIC-wait histogram -- per-burst NIC wait cycles from profiling_timing_gpu.csv
+  5. Throughput vs offered rate -- T1 vs T4
 
 Usage:
-  python3 analyze.py [--stats FILE] [--timing-udp FILE] [--timing-tcp FILE]
-                     [--gpu-clock-mhz N] [--outdir DIR]
+  python3 profiling/analyze.py \\
+      --bench  results/benchmark_YYYYMMDD_HHMMSS.csv \\
+      --timing profiling_out/profiling_timing_gpu.csv \\
+      --outdir profiling_out/plots/
 
-  --stats          profiling_stats.csv from one run (default: profiling_stats.csv)
-  --timing-udp     profiling_timing_udp.csv (default: profiling_timing_udp.csv)
-  --timing-tcp     profiling_timing_tcp.csv (default: profiling_timing_tcp.csv)
-  --gpu-clock-mhz  GPU SM clock in MHz for cycle→µs conversion (default: 1695
-                   for NVIDIA A2 boost clock)
-  --outdir         directory to write PNG files (default: profiling_plots/)
+  --bench          Path to benchmark_harness results CSV (required for plots 1-3, 5)
+  --timing         Path to profiling_timing_gpu.csv from gpu_receiver (required for plot 4)
+  --gpu-clock-mhz  GPU SM clock in MHz (default: 1695 for NVIDIA A2 boost clock)
+  --outdir         Directory to write PNG files (default: profiling_plots/)
 """
 
 import argparse
@@ -32,15 +35,14 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
 except ImportError:
-    print("matplotlib not found — install with: pip install matplotlib")
+    print("matplotlib not found -- install with: pip install matplotlib")
     sys.exit(1)
 
 try:
     import pandas as pd
 except ImportError:
-    print("pandas not found — install with: pip install pandas")
+    print("pandas not found -- install with: pip install pandas")
     sys.exit(1)
 
 
@@ -48,161 +50,316 @@ except ImportError:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def cycles_to_us(cycles, gpu_clock_mhz):
-    """Convert GPU clock64() cycle delta to microseconds."""
-    return cycles / gpu_clock_mhz
-
-
-def save(fig, path, outdir):
+def save(fig, filename, outdir):
     os.makedirs(outdir, exist_ok=True)
-    full = os.path.join(outdir, path)
-    fig.savefig(full, dpi=150, bbox_inches="tight")
-    print(f"  Saved {full}")
+    path = os.path.join(outdir, filename)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  Saved {path}")
     plt.close(fig)
 
 
+def ns_to_us(ns):
+    return ns / 1e3
+
+
+def cycles_to_us(cycles, gpu_clock_mhz):
+    return cycles / gpu_clock_mhz
+
+
+def load_bench(bench_csv):
+    """Load benchmark_harness CSV. Expected columns (subset):
+       tier, rate, tick_id, t1_ns, t2_ns, t3_ns, t4_ns, compute_ns,
+       e2e_ns, ingest_ns
+    """
+    try:
+        df = pd.read_csv(bench_csv)
+    except FileNotFoundError:
+        print(f"  File not found: {bench_csv}")
+        return None
+
+    # Normalise column names (strip whitespace)
+    df.columns = df.columns.str.strip()
+
+    required = {"tier", "t1_ns", "t2_ns", "t3_ns", "t4_ns"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"  Missing columns in {bench_csv}: {missing}")
+        print(f"  Available columns: {list(df.columns)}")
+        return None
+
+    # Derive columns if not present
+    if "e2e_ns" not in df.columns:
+        df["e2e_ns"] = df["t4_ns"] - df["t1_ns"]
+    if "ingest_ns" not in df.columns:
+        df["ingest_ns"] = df["t2_ns"] - df["t1_ns"]
+    if "compute_ns" not in df.columns:
+        df["compute_ns"] = df["t3_ns"] - df["t2_ns"]
+    if "egress_ns" not in df.columns:
+        df["egress_ns"] = df["t4_ns"] - df["t3_ns"]
+
+    # Filter out obviously bogus rows (negative latencies from clock drift)
+    df = df[(df["e2e_ns"] > 0) & (df["e2e_ns"] < 10_000_000)]  # < 10 ms
+
+    # Derive rate from data if not present (benchmark_harness writes it)
+    if "rate" not in df.columns:
+        df["rate"] = 0  # unknown
+
+    print(f"  Loaded {len(df)} rows from {bench_csv}")
+    print(f"  Tiers present: {sorted(df['tier'].unique())}")
+    if "rate" in df.columns:
+        print(f"  Rates present: {sorted(df['rate'].unique())}")
+    return df
+
+
 # ---------------------------------------------------------------------------
-# Plot 1: Throughput time series
+# Plot 1: E2E latency CDF -- T1 vs T4 at the highest common rate
 # ---------------------------------------------------------------------------
 
-def plot_throughput(stats_csv, outdir):
-    print(f"[1] Throughput time series from {stats_csv}")
-    try:
-        df = pd.read_csv(stats_csv)
-    except FileNotFoundError:
-        print(f"    File not found: {stats_csv} — skipping.")
+def plot_e2e_cdf(df, outdir):
+    print("[1] E2E latency CDF")
+
+    tiers = [1, 4]
+    colors = {1: "tab:orange", 4: "tab:blue"}
+    labels = {1: "T1 (CPU+POSIX)", 4: "T4 (DOCA GPUNetIO)"}
+
+    # Use the highest rate both tiers have in common, or all data if rate unknown
+    common_rates = None
+    if "rate" in df.columns and df["rate"].max() > 0:
+        for t in tiers:
+            rates = set(df[df["tier"] == t]["rate"].unique())
+            common_rates = rates if common_rates is None else common_rates & rates
+        rate = max(common_rates) if common_rates else None
+    else:
+        rate = None
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for tier in tiers:
+        subset = df[df["tier"] == tier]
+        if rate is not None:
+            subset = subset[subset["rate"] == rate]
+        if len(subset) == 0:
+            continue
+        latency_us = ns_to_us(subset["e2e_ns"].values)
+        sorted_lat = np.sort(latency_us)
+        cdf = np.arange(1, len(sorted_lat) + 1) / len(sorted_lat) * 100
+        ax.plot(sorted_lat, cdf, color=colors[tier], label=labels[tier], linewidth=1.5)
+        for pct, ls in [(50, "--"), (99, ":")]:
+            p = np.percentile(latency_us, pct)
+            ax.axvline(p, color=colors[tier], linestyle=ls, alpha=0.6,
+                       label=f"T{tier} p{pct}={p:.0f} us")
+
+    rate_str = f" @ {rate//1000}k ticks/s" if rate else ""
+    ax.set_xlabel("E2E latency (us)")
+    ax.set_ylabel("CDF (%)")
+    ax.set_title(f"End-to-End Latency CDF -- T1 vs T4{rate_str}")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    fig.tight_layout()
+    save(fig, "e2e_cdf.png", outdir)
+
+
+# ---------------------------------------------------------------------------
+# Plot 2: E2E p50/p99 vs offered rate -- T1 vs T4
+# ---------------------------------------------------------------------------
+
+def plot_latency_vs_rate(df, outdir):
+    print("[2] Latency vs offered rate")
+
+    if "rate" not in df.columns or df["rate"].max() == 0:
+        print("  No rate column -- skipping.")
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    tiers = sorted(df["tier"].unique())
+    colors = {1: "tab:orange", 2: "tab:green", 3: "tab:purple", 4: "tab:blue", 5: "tab:red"}
+    styles_p50 = {1: "-o", 2: "-s", 3: "-^", 4: "-D", 5: "-v"}
+    styles_p99 = {1: "--o", 2: "--s", 3: "--^", 4: "--D", 5: "--v"}
 
-    axes[0].plot(df["elapsed_sec"], df["udp_total"], label="UDP total", color="tab:blue")
-    axes[0].plot(df["elapsed_sec"], df["udp_dns"],   label="UDP DNS",   color="tab:orange", linestyle="--")
-    axes[0].set_ylabel("Packets / sec")
-    axes[0].set_title("UDP Throughput (per second)")
-    axes[0].legend(fontsize=8)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for tier in tiers:
+        sub = df[df["tier"] == tier]
+        rates = sorted(sub["rate"].unique())
+        p50s, p99s = [], []
+        for r in rates:
+            lat = ns_to_us(sub[sub["rate"] == r]["e2e_ns"].values)
+            p50s.append(np.percentile(lat, 50))
+            p99s.append(np.percentile(lat, 99))
+        c = colors.get(tier, "black")
+        rates_k = [r / 1000 for r in rates]
+        ax.plot(rates_k, p50s, styles_p50.get(tier, "-o"), color=c,
+                label=f"T{tier} p50", linewidth=1.5)
+        ax.plot(rates_k, p99s, styles_p99.get(tier, "--o"), color=c,
+                label=f"T{tier} p99", linewidth=1.5, alpha=0.7)
+
+    ax.set_xlabel("Offered rate (k ticks/sec)")
+    ax.set_ylabel("E2E latency (us)")
+    ax.set_title("E2E Latency vs Offered Rate -- T1 vs T4")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    save(fig, "latency_vs_rate.png", outdir)
+
+
+# ---------------------------------------------------------------------------
+# Plot 3: Stage breakdown stacked bar -- ingest / compute / egress
+# ---------------------------------------------------------------------------
+
+def plot_stage_breakdown(df, outdir):
+    print("[3] Stage breakdown stacked bar")
+
+    if "rate" not in df.columns or df["rate"].max() == 0:
+        print("  No rate column -- skipping stage breakdown.")
+        return
+
+    focus_tiers = [t for t in [1, 4] if t in df["tier"].values]
+    rates = sorted(df["rate"].unique())
+    stages = ["ingest_ns", "compute_ns", "egress_ns"]
+    stage_labels = ["Ingest (NIC->GPU)", "Compute (EMA+RSI)", "Egress (ring write)"]
+    colors = ["#4878cf", "#6acc65", "#d65f5f"]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(rates) * len(focus_tiers) * 0.8 + 2), 5))
+
+    n_groups = len(rates)
+    n_tiers = len(focus_tiers)
+    group_w = 0.8
+    bar_w = group_w / n_tiers
+    tier_labels_map = {1: "T1 (CPU)", 4: "T4 (GPUNetIO)"}
+
+    for ti, tier in enumerate(focus_tiers):
+        sub_tier = df[df["tier"] == tier]
+        xs = []
+        bottoms = np.zeros(n_groups)
+        for si, (stage, slabel, color) in enumerate(zip(stages, stage_labels, colors)):
+            vals = []
+            for ri, rate in enumerate(rates):
+                sub = sub_tier[sub_tier["rate"] == rate]
+                vals.append(ns_to_us(np.percentile(sub[stage].values, 50))
+                            if len(sub) > 0 else 0)
+            vals = np.array(vals)
+            x = np.arange(n_groups) * (n_tiers + 0.5) + ti * bar_w
+            label = slabel if ti == 0 else None
+            ax.bar(x, vals, width=bar_w, bottom=bottoms, color=color,
+                   label=label, edgecolor="white", linewidth=0.5)
+            bottoms += vals
+            if si == 0:
+                xs = x
+
+        # Annotate tier label at base
+        for xi, x_pos in enumerate(xs):
+            ax.text(x_pos + bar_w / 2, -2, tier_labels_map.get(tier, f"T{tier}"),
+                    ha="center", va="top", fontsize=7, rotation=45)
+
+    # x-axis tick at group centre
+    group_centres = np.arange(n_groups) * (n_tiers + 0.5) + (n_tiers - 1) * bar_w / 2
+    ax.set_xticks(group_centres)
+    ax.set_xticklabels([f"{r//1000}k" for r in rates])
+    ax.set_xlabel("Offered rate (ticks/sec)")
+    ax.set_ylabel("p50 latency (us)")
+    ax.set_title("Stage Latency Breakdown -- T1 vs T4")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    save(fig, "stage_breakdown.png", outdir)
+
+
+# ---------------------------------------------------------------------------
+# Plot 4: NIC-wait histogram from profiling_timing_gpu.csv
+# ---------------------------------------------------------------------------
+
+def plot_nic_wait(timing_csv, gpu_clock_mhz, outdir):
+    print(f"[4] NIC-wait histogram from {timing_csv}")
+    try:
+        df = pd.read_csv(timing_csv)
+    except FileNotFoundError:
+        print(f"  File not found: {timing_csv} -- skipping.")
+        return
+
+    df.columns = df.columns.str.strip()
+    if "nic_wait_cycles" not in df.columns:
+        print("  nic_wait_cycles column not found -- skipping.")
+        return
+
+    wait_us = cycles_to_us(df["nic_wait_cycles"].values, gpu_clock_mhz)
+    wait_us = wait_us[wait_us > 0]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Histogram (clipped at 99th percentile for readability)
+    p99 = np.percentile(wait_us, 99)
+    axes[0].hist(wait_us[wait_us <= p99 * 1.5], bins=80, color="tab:blue",
+                 edgecolor="white", linewidth=0.3, density=True)
+    axes[0].axvline(np.percentile(wait_us, 50), color="black", linestyle="--",
+                    label=f"p50 = {np.percentile(wait_us,50):.1f} us")
+    axes[0].axvline(p99, color="red", linestyle=":", label=f"p99 = {p99:.1f} us")
+    axes[0].set_xlabel("NIC-wait time per burst (us)")
+    axes[0].set_ylabel("Density")
+    axes[0].set_title("Per-Burst NIC-Wait Distribution (T4)")
+    axes[0].legend(fontsize=9)
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(df["elapsed_sec"], df["tcp_total"],    label="TCP total",    color="tab:green")
-    axes[1].plot(df["elapsed_sec"], df["tcp_http"],     label="TCP HTTP",     color="tab:red",    linestyle="--")
-    axes[1].plot(df["elapsed_sec"], df["tcp_http_get"], label="TCP HTTP GET", color="tab:purple", linestyle=":")
-    axes[1].plot(df["elapsed_sec"], df["tcp_syn"],      label="TCP SYN",      color="tab:brown",  linestyle="-.")
-    axes[1].set_ylabel("Packets / sec")
-    axes[1].set_xlabel("Elapsed time (s)")
-    axes[1].set_title("TCP Throughput (per second)")
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    save(fig, "throughput_timeseries.png", outdir)
-
-
-# ---------------------------------------------------------------------------
-# Plot 2: Intra-kernel timing breakdown (stacked bar)
-# ---------------------------------------------------------------------------
-
-def plot_timing_breakdown(timing_csv, protocol, gpu_clock_mhz, outdir):
-    print(f"[2] Intra-kernel timing breakdown ({protocol}) from {timing_csv}")
-    try:
-        df = pd.read_csv(timing_csv)
-    except FileNotFoundError:
-        print(f"    File not found: {timing_csv} — skipping.")
-        return
-
-    # Convert cycles to microseconds
-    for col in ["nic_wait_cycles", "compute_cycles", "semaphore_cycles"]:
-        df[col.replace("_cycles", "_us")] = cycles_to_us(df[col], gpu_clock_mhz)
-
-    nic_wait = df["nic_wait_us"]
-    compute  = df["compute_us"]
-    sem      = df["semaphore_us"]
-
-    labels = ["NIC wait", "Payload compute", "Semaphore write"]
-    means  = [nic_wait.mean(), compute.mean(), sem.mean()]
-    p99s   = [np.percentile(nic_wait, 99), np.percentile(compute, 99), np.percentile(sem, 99)]
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    # Left: stacked bar (mean breakdown)
-    bottom = 0
-    colors = ["#4878cf", "#6acc65", "#d65f5f"]
-    x = [0]
-    for label, mean, color in zip(labels, means, colors):
-        axes[0].bar(x, mean, bottom=bottom, label=f"{label} ({mean:.2f} µs)", color=color, width=0.5)
-        bottom += mean
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels([f"{protocol} kernel"])
-    axes[0].set_ylabel("Mean latency (µs)")
-    axes[0].set_title(f"{protocol} Kernel — Mean Stage Breakdown")
-    axes[0].legend(fontsize=9)
-    axes[0].grid(True, axis="y", alpha=0.3)
-
-    # Right: CDF of per-iteration total latency
-    total_us = nic_wait + compute + sem
-    sorted_total = np.sort(total_us)
-    cdf = np.arange(1, len(sorted_total) + 1) / len(sorted_total)
-    axes[1].plot(sorted_total, cdf * 100, color="tab:blue")
-    axes[1].axvline(np.percentile(total_us, 50), color="gray",   linestyle="--", label="p50")
-    axes[1].axvline(np.percentile(total_us, 99), color="red",    linestyle="--", label="p99")
-    axes[1].set_xlabel("Total iteration latency (µs)")
+    # CDF
+    sorted_w = np.sort(wait_us)
+    cdf = np.arange(1, len(sorted_w) + 1) / len(sorted_w) * 100
+    axes[1].plot(sorted_w, cdf, color="tab:blue", linewidth=1.5)
+    axes[1].axvline(np.percentile(wait_us, 50), color="black", linestyle="--",
+                    alpha=0.7, label=f"p50 = {np.percentile(wait_us,50):.1f} us")
+    axes[1].axvline(p99, color="red", linestyle=":", alpha=0.7,
+                    label=f"p99 = {p99:.1f} us")
+    axes[1].set_xlabel("NIC-wait time per burst (us)")
     axes[1].set_ylabel("CDF (%)")
-    axes[1].set_title(f"{protocol} Kernel — Per-Iteration Latency CDF")
+    axes[1].set_title("NIC-Wait CDF (T4)")
     axes[1].legend(fontsize=9)
     axes[1].grid(True, alpha=0.3)
+    axes[1].set_xlim(left=0)
 
-    fig.suptitle(f"{protocol} CUDA Kernel — Intra-Kernel Timing  (GPU clock: {gpu_clock_mhz} MHz)", y=1.01)
+    # Print summary
+    print(f"  NIC-wait summary  (n={len(wait_us)} bursts, GPU clock {gpu_clock_mhz} MHz):")
+    for pct in [50, 90, 99]:
+        print(f"    p{pct:>2} = {np.percentile(wait_us, pct):8.2f} us")
+    print(f"    mean = {wait_us.mean():8.2f} us   max = {wait_us.max():.2f} us")
+
     fig.tight_layout()
-    save(fig, f"timing_breakdown_{protocol.lower()}.png", outdir)
-
-    # Print summary table
-    print(f"\n  {protocol} kernel stage summary (µs):")
-    print(f"  {'Stage':<20} {'Mean':>8} {'p50':>8} {'p99':>8} {'Max':>8}")
-    print(f"  {'-'*52}")
-    for label, col in zip(labels, [nic_wait, compute, sem]):
-        print(f"  {label:<20} {col.mean():>8.2f} {np.percentile(col,50):>8.2f} "
-              f"{np.percentile(col,99):>8.2f} {col.max():>8.2f}")
-    total = nic_wait + compute + sem
-    print(f"  {'Total':<20} {total.mean():>8.2f} {np.percentile(total,50):>8.2f} "
-          f"{np.percentile(total,99):>8.2f} {total.max():>8.2f}")
-    print()
+    save(fig, "nic_wait.png", outdir)
 
 
 # ---------------------------------------------------------------------------
-# Plot 3: NIC-wait fraction vs compute fraction over time
+# Plot 5: Throughput vs offered rate
 # ---------------------------------------------------------------------------
 
-def plot_wait_fraction(timing_csv, protocol, gpu_clock_mhz, outdir):
-    print(f"[3] NIC-wait fraction over iterations ({protocol})")
-    try:
-        df = pd.read_csv(timing_csv)
-    except FileNotFoundError:
+def plot_throughput_vs_rate(df, outdir):
+    print("[5] Throughput vs offered rate")
+
+    if "rate" not in df.columns or df["rate"].max() == 0:
+        print("  No rate column -- skipping.")
         return
 
-    for col in ["nic_wait_cycles", "compute_cycles", "semaphore_cycles"]:
-        df[col.replace("_cycles", "_us")] = cycles_to_us(df[col], gpu_clock_mhz)
+    tiers = sorted(df["tier"].unique())
+    colors = {1: "tab:orange", 2: "tab:green", 3: "tab:purple", 4: "tab:blue", 5: "tab:red"}
 
-    total = df["nic_wait_us"] + df["compute_us"] + df["semaphore_us"]
-    wait_frac    = df["nic_wait_us"] / total * 100
-    compute_frac = df["compute_us"]  / total * 100
-    sem_frac     = df["semaphore_us"]/ total * 100
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for tier in tiers:
+        sub = df[df["tier"] == tier]
+        rates = sorted(sub["rate"].unique())
+        achieved = []
+        for r in rates:
+            n = len(sub[sub["rate"] == r])
+            achieved.append(n)
+        fractions = [a / r * 100 if r > 0 else 0
+                     for a, r in zip(achieved, rates)]
+        ax.plot([r / 1000 for r in rates], fractions,
+                "-o", color=colors.get(tier, "black"),
+                label=f"T{tier}", linewidth=1.5)
 
-    # Smooth with a rolling window for readability
-    win = max(1, len(df) // 50)
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.stackplot(df["slot"],
-                 wait_frac.rolling(win, min_periods=1).mean(),
-                 compute_frac.rolling(win, min_periods=1).mean(),
-                 sem_frac.rolling(win, min_periods=1).mean(),
-                 labels=["NIC wait", "Payload compute", "Semaphore write"],
-                 colors=["#4878cf", "#6acc65", "#d65f5f"],
-                 alpha=0.85)
-    ax.set_xlabel("Batch iteration")
-    ax.set_ylabel("Fraction of iteration time (%)")
-    ax.set_title(f"{protocol} Kernel — Time Composition per Batch")
-    ax.legend(loc="upper right", fontsize=9)
-    ax.set_ylim(0, 100)
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xlabel("Offered rate (k ticks/sec)")
+    ax.set_ylabel("Received ticks (% of offered)")
+    ax.set_title("Throughput vs Offered Rate -- T1 vs T4")
+    ax.set_ylim(0, 110)
+    ax.axhline(100, color="gray", linestyle="--", alpha=0.5, label="100% (no drop)")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    save(fig, f"wait_fraction_{protocol.lower()}.png", outdir)
+    save(fig, "throughput_vs_rate.png", outdir)
 
 
 # ---------------------------------------------------------------------------
@@ -210,25 +367,43 @@ def plot_wait_fraction(timing_csv, protocol, gpu_clock_mhz, outdir):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="DOCA GPUNetIO profiling analysis")
-    parser.add_argument("--stats",        default="profiling_stats.csv")
-    parser.add_argument("--timing-udp",   default="profiling_timing_udp.csv")
-    parser.add_argument("--timing-tcp",   default="profiling_timing_tcp.csv")
+    parser = argparse.ArgumentParser(
+        description="DOCA GPUNetIO profiling analysis -- generate report figures")
+    parser.add_argument("--bench",
+        help="Path to benchmark_harness results CSV")
+    parser.add_argument("--timing",
+        help="Path to profiling_timing_gpu.csv from gpu_receiver")
     parser.add_argument("--gpu-clock-mhz", type=float, default=1695.0,
-                        help="GPU SM clock in MHz (default: 1695 for NVIDIA A2 boost)")
-    parser.add_argument("--outdir",       default="profiling_plots")
+        help="GPU SM clock in MHz (default: 1695 for NVIDIA A2 boost)")
+    parser.add_argument("--outdir", default="profiling_plots",
+        help="Directory to write PNG files (default: profiling_plots/)")
     args = parser.parse_args()
 
-    print(f"GPU clock assumed: {args.gpu_clock_mhz} MHz")
-    print(f"Output directory : {args.outdir}\n")
+    print(f"GPU clock: {args.gpu_clock_mhz} MHz")
+    print(f"Output:    {args.outdir}\n")
 
-    plot_throughput(args.stats, args.outdir)
+    df = None
+    if args.bench:
+        df = load_bench(args.bench)
 
-    for proto, csv_path in [("UDP", args.timing_udp), ("TCP", args.timing_tcp)]:
-        plot_timing_breakdown(csv_path, proto, args.gpu_clock_mhz, args.outdir)
-        plot_wait_fraction(csv_path, proto, args.gpu_clock_mhz, args.outdir)
+    if df is not None:
+        print()
+        plot_e2e_cdf(df, args.outdir)
+        plot_latency_vs_rate(df, args.outdir)
+        plot_stage_breakdown(df, args.outdir)
+        plot_throughput_vs_rate(df, args.outdir)
+    elif args.bench:
+        print("  Could not load benchmark CSV -- bench plots skipped.")
 
-    print("Done. Figures written to", args.outdir)
+    if args.timing:
+        print()
+        plot_nic_wait(args.timing, args.gpu_clock_mhz, args.outdir)
+    elif not args.bench:
+        print("No inputs provided. Use --bench and/or --timing.")
+        parser.print_help()
+        sys.exit(1)
+
+    print("\nDone. Figures written to", args.outdir)
 
 
 if __name__ == "__main__":

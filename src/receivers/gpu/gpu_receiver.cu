@@ -49,6 +49,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -75,6 +76,12 @@
 #define RESULT_QUEUE_DEPTH 65536
 #define SEND_BATCH         1024
 #define MAX_RX_TIMEOUT_NS  10000000ULL  /* 10ms timeout */
+/* Per-burst NIC-wait timing ring: stores (t0, t2_burst, n_pkts) per burst.
+ * t0 = clock64() before warp recv; t2_burst = clock64() right after recv
+ * returns. Delta = NIC-wait cycles for that burst. 4096 slots at ~3k
+ * bursts/sec covers ~1.3 s before wrapping; drained to CSV on shutdown. */
+#define TIMING_BUF_SLOTS   4096
+#define TIMING_BUF_STRIDE  3
 
 #define CUDA_CHECK(call) \
     do { cudaError_t _e=(call); if(_e!=cudaSuccess){ \
@@ -248,7 +255,8 @@ __global__ void gpu_recv_process_kernel(
     uint8_t                  tier,
     int                      use_nic_t1,
     int                      light_mode,
-    int                      bench_work_iters)
+    int                      bench_work_iters,
+    uint64_t                *timing_buf)
 {
     const int tid = threadIdx.x;
 
@@ -259,6 +267,10 @@ __global__ void gpu_recv_process_kernel(
     __shared__ uint64_t s_addr_zero;
     __shared__ uint64_t s_port_miss;
     __shared__ uint64_t s_ring_writes;
+    /* ── NIC-wait timing ring (profiling) ── */
+    __shared__ uint64_t s_t0_burst;    /* clock64() before warp recv */
+    __shared__ uint64_t s_t2_burst;    /* clock64() right after warp recv returns */
+    __shared__ uint64_t s_burst_idx;   /* monotonic burst counter, wraps into ring */
     if (tid == 0) {
         s_poll_count  = 0;
         s_recv_count  = 0;
@@ -266,6 +278,9 @@ __global__ void gpu_recv_process_kernel(
         s_addr_zero   = 0;
         s_port_miss   = 0;
         s_ring_writes = 0;
+        s_t0_burst    = 0;
+        s_t2_burst    = 0;
+        s_burst_idx   = 0;
     }
     __syncthreads();
 
@@ -276,6 +291,11 @@ __global__ void gpu_recv_process_kernel(
     __shared__ uint64_t s_ring_base;
 
     while (!*quit_flag) {
+        /* Capture t0 before blocking in the warp recv call.
+         * All threads sync so s_t0_burst is visible to all before recv. */
+        if (tid == 0) s_t0_burst = clock64();
+        __syncwarp();
+
         /* ── All 32 warp threads participate in the recv (WARP-scope) ──
          * The template variant auto-advances DOCA's internal consumer
          * cursor via its trailing __syncwarp(), so every packet is
@@ -293,6 +313,7 @@ __global__ void gpu_recv_process_kernel(
                                 NULL);
         if (tid == 0) {
             s_ret = warp_ret;
+            s_t2_burst = clock64();   /* recv has returned — packets (if any) are in GPU memory */
 
             s_poll_count++;
             if (s_ret != DOCA_SUCCESS && s_ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
@@ -321,6 +342,16 @@ __global__ void gpu_recv_process_kernel(
                        (unsigned long long)s_ring_writes);
         }
         __syncthreads();  /* All threads now see s_n_pkts, s_first_pkt_idx, s_ret */
+
+        /* Write per-burst NIC-wait timing entry. Only when pkts arrived so
+         * idle polls (timeout returns) don't pollute the histogram. */
+        if (tid == 0 && timing_buf != nullptr && s_n_pkts > 0) {
+            uint64_t slot = s_burst_idx % TIMING_BUF_SLOTS;
+            timing_buf[slot * TIMING_BUF_STRIDE + 0] = s_t0_burst;
+            timing_buf[slot * TIMING_BUF_STRIDE + 1] = s_t2_burst;
+            timing_buf[slot * TIMING_BUF_STRIDE + 2] = (uint64_t)s_n_pkts;
+            s_burst_idx++;
+        }
 
         /* ── Each thread processes one packet ── */
         uintptr_t buf_addr = 0;
@@ -1058,6 +1089,12 @@ int main(int argc, char **argv)
     DocaContext doca{};
     if (doca_init(doca, nic_pcie, gpu_pcie, cuda_device) < 0) return 1;
 
+    /* NIC-wait timing ring buffer (profiling) */
+    uint64_t *d_timing_buf = nullptr;
+    size_t timing_sz = TIMING_BUF_SLOTS * TIMING_BUF_STRIDE * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&d_timing_buf, timing_sz));
+    CUDA_CHECK(cudaMemset(d_timing_buf, 0, timing_sz));
+
     /* Per-instrument state arrays */
     double *d_fast_ema = nullptr, *d_slow_ema = nullptr;
     double *d_avg_gain = nullptr, *d_avg_loss = nullptr, *d_last_mid = nullptr;
@@ -1170,7 +1207,8 @@ int main(int argc, char **argv)
         tier,
         g_use_nic_t1 ? 1 : 0,
         g_light_bench ? 1 : 0,
-        g_bench_work_iters);
+        g_bench_work_iters,
+        d_timing_buf);
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;
@@ -1217,6 +1255,34 @@ int main(int argc, char **argv)
     /* Stop forwarding thread */
     fwd_ctx.stop = true;
     fwd_thread.join();
+
+    /* Dump NIC-wait timing ring to CSV for runtime breakdown analysis */
+    {
+        std::vector<uint64_t> h_timing(TIMING_BUF_SLOTS * TIMING_BUF_STRIDE, 0);
+        CUDA_CHECK(cudaMemcpy(h_timing.data(), d_timing_buf, timing_sz,
+                              cudaMemcpyDeviceToHost));
+        FILE *fp = fopen("profiling_timing_gpu.csv", "w");
+        if (fp) {
+            fprintf(fp, "burst_idx,t0_cycles,t2_cycles,n_pkts,nic_wait_cycles\n");
+            for (int i = 0; i < TIMING_BUF_SLOTS; ++i) {
+                uint64_t t0 = h_timing[(size_t)i * TIMING_BUF_STRIDE + 0];
+                uint64_t t2 = h_timing[(size_t)i * TIMING_BUF_STRIDE + 1];
+                uint64_t np = h_timing[(size_t)i * TIMING_BUF_STRIDE + 2];
+                if (np > 0)
+                    fprintf(fp, "%d,%llu,%llu,%llu,%llu\n",
+                            i,
+                            (unsigned long long)t0,
+                            (unsigned long long)t2,
+                            (unsigned long long)np,
+                            (unsigned long long)(t2 - t0));
+            }
+            fclose(fp);
+            fprintf(stderr, "[gpu_receiver] profiling_timing_gpu.csv written\n");
+        } else {
+            perror("[gpu_receiver] fopen profiling_timing_gpu.csv");
+        }
+    }
+    cudaFree(d_timing_buf);
 
     /* Cleanup */
     doca_ctx_stop(doca.rxq_ctx);
