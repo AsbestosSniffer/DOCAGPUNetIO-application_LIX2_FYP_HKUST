@@ -935,7 +935,9 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         doca_flow_pipe_cfg_set_name(pipe_cfg, "GPU_RXQ_UDP_PIPE");
         doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
-        err = doca_flow_pipe_cfg_set_match(pipe_cfg, &udp_match, NULL);
+        struct doca_flow_match udp_mask = {};
+        udp_mask.outer.ip4.dst_ip = 0xFFFFFFFF;
+        err = doca_flow_pipe_cfg_set_match(pipe_cfg, &udp_match, &udp_mask);
         fprintf(stderr, "[DBG]   udp_set_match -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) { doca_flow_pipe_cfg_destroy(pipe_cfg); return -1; }
         doca_flow_pipe_cfg_set_monitor(pipe_cfg, &udp_monitor);
