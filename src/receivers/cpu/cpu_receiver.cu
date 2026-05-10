@@ -512,7 +512,11 @@ int main(int argc, char **argv)
         }
 
         if (n == sizeof(TickMessage)) {
-            if (batch_n == 0) batch_start_ns = now_ns();
+            if (batch_n == 0) {
+                batch_start_ns = now_ns();
+                // theoretically this should measure the kernel space to user space copy time for a batch
+                nvtxRangePushA("batch_fill");
+            }
             ++batch_n;
             ++total_recv;
 
@@ -529,6 +533,7 @@ int main(int argc, char **argv)
                              (now_ns() - batch_start_ns) >= DEFAULT_MAX_BATCH_LATENCY_NS);
 
         if (batch_full || recv_timeout || age_flush) {
+            if (batch_n > 0) nvtxRangePop(); // batch_fill but don't count empty batches that timed out. 
             process_batch(gpu, batch_n,
                           harness_fd, harness_dest,
                           signal_fd,  signal_dest,

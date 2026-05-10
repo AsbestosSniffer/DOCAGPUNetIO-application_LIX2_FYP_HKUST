@@ -1,6 +1,6 @@
-PWD c:\Users\admin\Downloads\Formatting_Instructions_For_NeurIPS_2026 (1)
+PWD c:\Users\admin\Downloads\COMP6211L_Project\DOCAGPUNetIO-application_LIX2_FYP_HKUST\report
 INPUT C:\Users\admin\AppData\Local\MiKTeX\miktex\data\le\pdftex\pdflatex.fmt
-INPUT c:\Users\admin\Downloads\Formatting_Instructions_For_NeurIPS_2026 (1)\neurips_2026.tex
+INPUT c:\Users\admin\Downloads\COMP6211L_Project\DOCAGPUNetIO-application_LIX2_FYP_HKUST\report\neurips_2026.tex
 OUTPUT neurips_2026.log
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\base\article.cls
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\base\article.cls
@@ -163,12 +163,12 @@ INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8t.
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8t.tfm
-INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\t1phv.fd
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\t1phv.fd
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\t1phv.fd
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\helvetic\phvr8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmri8t.tfm
+INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8t.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\ts1ptm.fd
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\ts1ptm.fd
@@ -184,12 +184,12 @@ INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmr8t.v
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8r.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmb8t.vf
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8r.tfm
-INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmr8t.vf
-INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8r.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\helvetic\phvr8t.vf
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\helvetic\phvr8r.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmri8t.vf
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmri8r.tfm
+INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmr8t.vf
+INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmr8r.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmb8t.vf
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8r.tfm
 INPUT C:\Users\admin\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmr8c.vf
