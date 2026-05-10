@@ -1004,6 +1004,24 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
                 doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
 
+        /* Low-priority catch-all: drop all other IPv4 UDP (e.g. background 239.0.0.1:9005).
+         * Priority 0 < 1 so the port-5005 entry above wins for matching traffic. */
+        struct doca_flow_match drop_match = {};
+        drop_match.outer.eth.type = htons(DOCA_FLOW_ETHER_TYPE_IPV4);
+        drop_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+        drop_match.outer.ip4.next_proto = IPPROTO_UDP;
+
+        struct doca_flow_fwd drop_fwd = {};
+        drop_fwd.type = DOCA_FLOW_FWD_DROP;
+
+        struct doca_flow_pipe_entry *drop_entry = nullptr;
+        err = doca_flow_pipe_control_add_entry(0, root_pipe,
+                                                &drop_match, NULL, NULL, NULL, NULL,
+                                                NULL, NULL, 0, &drop_fwd, NULL, &drop_entry);
+        fprintf(stderr, "[DBG]   root_control_add_entry(DROP) -> %s (%d)\n",
+                doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
         err = doca_flow_entries_process(doca.flow_port, 0, 10000, 0);
         fprintf(stderr, "[DBG]   root_entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
