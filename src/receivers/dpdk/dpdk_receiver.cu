@@ -91,19 +91,12 @@ static int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 
     if (rte_eth_dev_start(port) < 0) return -1;
 
-    /* Enable promiscuous mode so we receive multicast */
+    /* Promiscuous mode is not needed for unicast, but keeps the NIC
+     * flexible during development (allows debug traffic through). */
     rte_eth_promiscuous_enable(port);
 
-    /* Join multicast group via igmp (done at OS level or via DPDK filter) */
-    struct rte_ether_addr mcast_mac;
-    /* 239.0.0.1 → 01:00:5e:00:00:01 */
-    mcast_mac.addr_bytes[0] = 0x01;
-    mcast_mac.addr_bytes[1] = 0x00;
-    mcast_mac.addr_bytes[2] = 0x5e;
-    mcast_mac.addr_bytes[3] = 0x00;
-    mcast_mac.addr_bytes[4] = 0x00;
-    mcast_mac.addr_bytes[5] = 0x01;
-    rte_eth_dev_set_mc_addr_list(port, &mcast_mac, 1);
+    /* Unicast mode: no multicast MAC filter. Packets arrive directly
+     * from lxcpu2 (192.168.200.2) destined for 192.168.200.1:5005. */
 
     /* rte_flow rule: steer UDP dst port 5005 to RX queue 0.
      * Required for mlx5 bifurcated driver — without this, kernel gets all traffic. */

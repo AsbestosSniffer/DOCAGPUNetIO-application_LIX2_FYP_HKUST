@@ -47,7 +47,7 @@ TICK_FMT  = "=QIHBBdddd"
 TICK_SIZE = struct.calcsize(TICK_FMT)
 assert TICK_SIZE == 48, f"TickMessage size mismatch: {TICK_SIZE}"
 
-MCAST_ADDR = "239.0.0.1"
+MCAST_ADDR = "192.168.200.1"  # unicast: lxcpu1 ens21f0np0 direct link
 MCAST_PORT = 5005
 SOURCE_REPLAY = 0
 SOURCE_LIVE   = 1

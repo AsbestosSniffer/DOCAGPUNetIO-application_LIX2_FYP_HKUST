@@ -34,7 +34,8 @@ struct TickMessage {
 
 static_assert(sizeof(TickMessage) == 48, "TickMessage must be exactly 48 bytes");
 
-#define TICK_MCAST_ADDR  "239.0.0.1"
+/* Unicast destination: lxcpu1 ens21f0np0 direct link (192.168.200.0/30) */
+#define TICK_MCAST_ADDR  "192.168.200.1"
 #define TICK_MCAST_PORT  5005
 
 #define TICK_SOURCE_REPLAY 0

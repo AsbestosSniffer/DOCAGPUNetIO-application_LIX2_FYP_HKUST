@@ -110,30 +110,12 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port,
         perror("bind"); close(fd); return -1;
     }
 
-    /* ip_mreqn lets us specify the interface by index, not by IP address.
-     * This is the only reliable way when the interface has no unicast IP
-     * in the same subnet, or when INADDR_ANY would pick lo instead of the
-     * physical NIC that actually receives the DPU-sourced multicast frames. */
-    ip_mreqn mreq{};
-    mreq.imr_multiaddr.s_addr = inet_addr(mcast_addr);
-    mreq.imr_address.s_addr   = INADDR_ANY;
-    if (iface_name && iface_name[0] != '\0') {
-        mreq.imr_ifindex = (int)if_nametoindex(iface_name);
-        if (mreq.imr_ifindex == 0) {
-            fprintf(stderr, "[cpu_receiver] ERROR: interface '%s' not found "
-                    "(check --iface flag or `ip link`)\n", iface_name);
-            close(fd); return -1;
-        }
-        fprintf(stderr, "[cpu_receiver] joining mcast %s on %s (ifindex=%d)\n",
-                mcast_addr, iface_name, mreq.imr_ifindex);
-    } else {
-        mreq.imr_ifindex = 0;  /* let kernel pick — works for loopback tests */
-        fprintf(stderr, "[cpu_receiver] joining mcast %s on INADDR_ANY "
-                "(loopback only — use --iface for real-NIC traffic)\n", mcast_addr);
-    }
-    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("IP_ADD_MEMBERSHIP"); close(fd); return -1;
-    }
+    /* Unicast mode: no multicast group join needed.
+     * Packets arrive directly from lxcpu2 (192.168.200.2) over the
+     * 192.168.200.0/30 direct link. Plain bind to 0.0.0.0:port suffices. */
+    fprintf(stderr, "[cpu_receiver] listening for unicast UDP on 0.0.0.0:%d\n", port);
+    (void)mcast_addr;   /* unused in unicast mode */
+    (void)iface_name;
 
     /* Timeout so partial batches get flushed when sender stops */
     struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */

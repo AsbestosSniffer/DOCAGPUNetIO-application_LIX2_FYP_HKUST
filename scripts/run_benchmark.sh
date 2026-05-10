@@ -51,10 +51,13 @@ SENDER_SSH="${SENDER_SSH:-lix2@lxcpu2.cse.ust.hk}"
 SENDER_REMOTE_DIR="${SENDER_REMOTE_DIR:-DOCAGPUNetIO-application_LIX2_FYP_HKUST}"
 SENDER_BIN="${SENDER_BIN:-\$HOME/$SENDER_REMOTE_DIR/bin/data_source}"
 SENDER_CSV="${SENDER_CSV:-\$HOME/$SENDER_REMOTE_DIR/data/ticks.csv}"
-SENDER_DEST="${SENDER_DEST:-192.168.100.2:6005}"
+# Direct unicast over 192.168.200.0/30 link (lxcpu2 ens132s0f0np0 → lxcpu1 ens21f0np0)
+SENDER_DEST="${SENDER_DEST:-192.168.200.1:5005}"
 SENDER_HOST="${SENDER_SSH#*@}"
 
-# ── DPU relay (lxcpu2 DPU ARM, reached *from* lxcpu2 host) ──────────────────
+# ── DPU relay — disabled in unicast-direct mode ───────────────────────────────
+# Set USE_RELAY=1 to re-enable the DPU relay (multicast path via 192.168.100.2).
+USE_RELAY="${USE_RELAY:-0}"
 DPU_USER="${DPU_USER:-ubuntu}"
 DPU_IP="${DPU_IP:-192.168.100.2}"
 DPU_RELAY_PATH="${DPU_RELAY_PATH:-/home/ubuntu/dpu_relay}"
@@ -353,7 +356,8 @@ ${C}═════════════════════════�
 EOF
 
 # ── Start dpu_relay on lxcpu2 DPU ARM (via lxcpu2 host) ──────────────────────
-if [[ -n "$SENDER_SSH" ]]; then
+# Skipped in unicast-direct mode (USE_RELAY=0). Set USE_RELAY=1 to re-enable.
+if [[ $USE_RELAY -eq 1 ]] && [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
@@ -373,6 +377,8 @@ if [[ -n "$SENDER_SSH" ]]; then
         exit 1
     fi
     log_ok "dpu_relay listening on $DPU_IP:$RELAY_PORT"
+elif [[ $USE_RELAY -eq 0 ]]; then
+    log "DPU relay skipped (USE_RELAY=0) — sender will unicast directly to $SENDER_DEST"
 fi
 
 # ── Cleanup trap ─────────────────────────────────────────────────────────────

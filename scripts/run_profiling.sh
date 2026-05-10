@@ -152,7 +152,7 @@ echo "  Example sender command:"
 echo "    ssh lix2@lxcpu2.cse.ust.hk \\"
 echo "      \"~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/bin/data_source \\"
 echo "        --mode replay --csv ~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/data/ticks.csv \\"
-echo "        --rate 100000 --dest 192.168.100.2:6005\""
+echo "        --rate 100000 --dest 192.168.200.1:5005\""
 echo ""
 read -rp "Press Enter when sender is running at 100k ticks/sec (Ctrl-C to abort)..."
 
