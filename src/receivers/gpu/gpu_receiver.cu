@@ -912,6 +912,7 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         udp_match.outer.ip4.dst_ip = htonl(inet_addr(TICK_MCAST_ADDR));
         udp_match.outer.ip4.next_proto = IPPROTO_UDP;
         udp_match.outer.ip4.version_ihl = 0;  /* unset, not required */
+        udp_match.outer.udp.dst_port = htons(TICK_MCAST_PORT);
 
         struct doca_flow_monitor udp_monitor = {};
         udp_monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
@@ -937,6 +938,7 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         struct doca_flow_match udp_mask = {};
         udp_mask.outer.ip4.dst_ip = 0xFFFFFFFF;
+        udp_mask.outer.udp.dst_port = 0xFFFF;
         err = doca_flow_pipe_cfg_set_match(pipe_cfg, &udp_match, &udp_mask);
         fprintf(stderr, "[DBG]   udp_set_match -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) { doca_flow_pipe_cfg_destroy(pipe_cfg); return -1; }
@@ -985,6 +987,10 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         root_match.outer.eth.type = htons(DOCA_FLOW_ETHER_TYPE_IPV4);
         root_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         root_match.outer.ip4.next_proto = IPPROTO_UDP;
+        root_match.outer.udp.dst_port = htons(TICK_MCAST_PORT);
+
+        struct doca_flow_match root_mask = {};
+        root_mask.outer.udp.dst_port = 0xFFFF;
 
         struct doca_flow_fwd root_fwd = {};
         root_fwd.type = DOCA_FLOW_FWD_PIPE;
@@ -992,7 +998,7 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
 
         struct doca_flow_pipe_entry *root_entry = nullptr;
         err = doca_flow_pipe_control_add_entry(0, root_pipe,
-                                                &root_match, NULL, NULL, NULL, NULL,
+                                                &root_match, &root_mask, NULL, NULL, NULL,
                                                 NULL, NULL, 1, &root_fwd, NULL, &root_entry);
         fprintf(stderr, "[DBG]   root_control_add_entry(UDP) -> %s (%d)\n",
                 doca_error_get_descr(err), (int)err);
